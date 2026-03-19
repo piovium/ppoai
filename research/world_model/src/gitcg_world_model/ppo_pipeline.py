@@ -1,0 +1,1797 @@
+from __future__ import annotations
+
+import json
+import math
+import random
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+import torch
+
+from .agents import HeuristicAgent, LegalRandomAgent, PolicyAgent
+from .bootstrap_agent import ScriptedBootstrapAgent
+from .decks import SMALL_DECK_MATCHUPS, SMALL_DECK_POOL
+from .event_analysis import analyze_episode_records
+from .event_rollout import run_event_episode
+from .p2sro import (
+    ActiveSlotState,
+    MetaMixtureAgent,
+    MetaStrategySnapshot,
+    P2SROConfig,
+    P2SROManager,
+    PayoffResult,
+    PolicyEntry,
+)
+from .ppo_agent import PpoAgent
+from .ppo_checkpoint import load_ppo_deployment_checkpoint, load_ppo_training_checkpoint
+from .ppo_model import PpoModelConfig
+from .inference_server import GpuInferenceServer, InferenceServerConfig
+from .opponent_identity import (
+    opponent_tag,
+    population_entity_id as shared_population_entity_id,
+)
+from .ppo_training import (
+    PpoTrainArtifacts,
+    PpoTrainingMetrics,
+    bootstrap_pretrain_from_episodes,
+    load_ppo_train_artifacts,
+    train_ppo_from_episodes,
+)
+from .progress import ProgressTracker, atomic_write_json
+from .managed_loop_utils import (
+    append_history,
+    auto_device,
+    cleanup_completed_round_training_temps,
+    prune_old_round_directories,
+    write_episode_analysis,
+    write_runtime_manifest,
+)
+from .replay import append_episode_records, load_episode_records
+from .schema import EnvConfig, EpisodeRecord, Matchup
+
+
+BootstrapProgressCallback = Callable[[int, int, EpisodeRecord], None]
+SelfPlayProgressCallback = Callable[[int, int, EpisodeRecord, str], None]
+
+
+@dataclass(frozen=True)
+class PpoManagedRoundResult:
+    round_index: int
+    bootstrap_path: str | None
+    self_play_path: str
+    train_artifacts: PpoTrainArtifacts
+    analysis_path: str
+    working_checkpoint: str
+    deployment_checkpoint: str
+
+
+@dataclass(frozen=True)
+class PpoManagedLoopArtifacts:
+    workspace: str
+    rounds: tuple[PpoManagedRoundResult, ...]
+    working_checkpoint: str
+    deployment_checkpoint: str
+    status_path: str
+    history_path: str
+    state_path: str
+
+
+@dataclass(frozen=True)
+class _LoopState:
+    working_checkpoint: Path | None
+    completed_round: int
+
+
+@dataclass(frozen=True)
+class _ResumeCursor:
+    round_index: int
+    phase: str
+
+
+
+def _default_model_config_value(name: str) -> int:
+    return int(PpoModelConfig.__dataclass_fields__[name].default)
+
+
+def _load_model_config_payload(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception:
+        return {}
+    config_payload = payload.get("model_config")
+    return dict(config_payload) if isinstance(config_payload, dict) else {}
+
+
+def _recommended_rollout_workers(requested_workers: int, checkpoint_path: Path | None) -> int:
+    config_payload = _load_model_config_payload(checkpoint_path)
+    d_model = int(config_payload.get("d_model", _default_model_config_value("d_model")))
+    num_layers = int(config_payload.get("num_layers", _default_model_config_value("num_layers")))
+    recurrent_hidden_dim = int(
+        config_payload.get("recurrent_hidden_dim", _default_model_config_value("recurrent_hidden_dim"))
+    )
+    if d_model >= 512 or num_layers >= 8 or recurrent_hidden_dim >= 512:
+        return max(1, min(requested_workers, 4))
+    if d_model >= 384 or num_layers >= 6 or recurrent_hidden_dim >= 384:
+        return max(1, min(requested_workers, 6))
+    return max(1, requested_workers)
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    max_safe_kl: float = 0.30
+    shortlist_size: int = 3
+    episodes_per_matchup: int = 4
+    fail_fast: bool = False
+    composite_tie_epsilon: float = 0.25
+
+
+@dataclass(frozen=True)
+class BenchmarkBucket:
+    name: str
+    opponent_kind: str
+    opponent_source: str
+    include_in_composite: bool = True
+
+
+@dataclass(frozen=True)
+class BenchmarkBucketResult:
+    bucket: str
+    opponent_kind: str
+    opponent_source: str
+    opponent_entity_id: str
+    include_in_composite: bool
+    episodes: int
+    ai_wins: int
+    opponent_wins: int
+    draws: int
+    score: int
+    average_steps: float
+    draw_rate: float = 0.0
+    late_round_rate: float = 0.0
+    average_round_number: float = 0.0
+    average_actions_per_round: float = 0.0
+    dice_waste_ratio: float = 0.0
+    declare_end_while_non_end_exists_rate: float = 0.0
+    matchup_results: tuple[dict[str, object], ...] = ()
+    global_rating_before: float | None = None
+    global_rating_after: float | None = None
+    selected_rating: float | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "bucket": self.bucket,
+            "opponent_kind": self.opponent_kind,
+            "opponent_source": self.opponent_source,
+            "opponent_entity_id": self.opponent_entity_id,
+            "include_in_composite": self.include_in_composite,
+            "episodes": self.episodes,
+            "ai_wins": self.ai_wins,
+            "opponent_wins": self.opponent_wins,
+            "draws": self.draws,
+            "score": self.score,
+            "average_steps": self.average_steps,
+            "draw_rate": self.draw_rate,
+            "late_round_rate": self.late_round_rate,
+            "average_round_number": self.average_round_number,
+            "average_actions_per_round": self.average_actions_per_round,
+            "dice_waste_ratio": self.dice_waste_ratio,
+            "declare_end_while_non_end_exists_rate": self.declare_end_while_non_end_exists_rate,
+            "matchup_results": [dict(item) for item in self.matchup_results],
+            "global_rating_before": self.global_rating_before,
+            "global_rating_after": self.global_rating_after,
+            "selected_rating": self.selected_rating,
+        }
+
+@dataclass(frozen=True)
+class _SlotCandidateEvaluation:
+    epoch: int
+    checkpoint_path: str
+    expected_payoff_vs_meta: float
+    matchup_results: tuple[dict[str, object], ...]
+    per_policy_payoffs: dict[str, float]
+    meta_policy_probabilities: dict[str, float]
+
+
+@dataclass(frozen=True)
+class _EpisodeJob:
+    job_index: int
+    matchup: Matchup
+    seed: int
+    agent0_factory: Callable[[int], _TaggedAgent]
+    agent1_factory: Callable[[int], _TaggedAgent]
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _EpisodeJobResult:
+    job: _EpisodeJob
+    episode: EpisodeRecord
+
+
+@dataclass
+class _TaggedAgent:
+    inner: PolicyAgent
+    trainable: bool
+    tag: str
+
+    def choose_action(self, context):
+        return self.inner.choose_action(context)
+
+    def observe_step(self, step) -> None:
+        if hasattr(self.inner, "observe_step"):
+            getattr(self.inner, "observe_step")(step)
+
+    def reset_history(self) -> None:
+        if hasattr(self.inner, "reset_history"):
+            getattr(self.inner, "reset_history")()
+
+    def pop_last_decision_metadata(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if hasattr(self.inner, "pop_last_decision_metadata"):
+            payload.update(dict(getattr(self.inner, "pop_last_decision_metadata")() or {}))
+        payload["ppo_trainable"] = self.trainable
+        payload["policy_tag"] = self.tag
+        return payload
+
+
+def build_checkpoint_agent_factory(
+    *,
+    checkpoint_path: str | Path,
+    device: str,
+    sample: bool,
+    temperature: float,
+    player_id: int,
+    trainable: bool,
+    tag: str,
+    opponent_tag: str,
+    opponent_entity_key: str = "unknown",
+    opponent_deck_name: str = "unknown",
+    cache: dict[tuple[str, str], tuple[Any, Any]] | None = None,
+    inference_server: GpuInferenceServer | None = None,
+    env_config: EnvConfig | None = None,
+) -> Callable[[int], _TaggedAgent]:
+    resolved = Path(checkpoint_path)
+    model, encoder = _cached_checkpoint_bundle(resolved, device=device, cache=cache)
+    model_key = str(resolved.resolve())
+    if inference_server is not None:
+        inference_server.register_model(model_key, model)
+
+    def factory(seed: int) -> _TaggedAgent:
+        del seed
+        agent = PpoAgent(
+            model=model,
+            encoder=encoder,
+            device=device,
+            sample=sample,
+            temperature=temperature,
+            player_id=player_id,
+            opponent_tag=opponent_tag,
+            opponent_entity_key=opponent_entity_key,
+            opponent_deck_name=opponent_deck_name,
+            inference_server=inference_server,
+            model_key=model_key,
+            env_config=env_config,
+        )
+        return _TaggedAgent(agent, trainable=trainable, tag=tag)
+
+    return factory
+
+
+def build_opponent_factory(
+    kind: str,
+    source: str,
+    *,
+    device: str,
+    sample: bool = True,
+    temperature: float = 1.0,
+    opponent_entity_key: str = "unknown",
+    opponent_deck_name: str = "unknown",
+    observed_opponent_tag: str = "unknown",
+    cache: dict[tuple[str, str], tuple[Any, Any]] | None = None,
+    inference_server: GpuInferenceServer | None = None,
+    env_config: EnvConfig | None = None,
+) -> Callable[[int], _TaggedAgent]:
+    if kind in {"main", "current", "best_response", "br", "frozen_population"}:
+        return build_checkpoint_agent_factory(
+            checkpoint_path=source,
+            device=device,
+            sample=sample,
+            temperature=temperature,
+            player_id=1,
+            trainable=False,
+            tag=f"{kind}:{Path(source).name}",
+            opponent_tag=observed_opponent_tag,
+            opponent_entity_key=opponent_entity_key,
+            opponent_deck_name=opponent_deck_name,
+            cache=cache,
+            inference_server=inference_server,
+            env_config=env_config,
+        )
+    normalized = source.strip().lower()
+    if normalized in {"baseline_heuristic", "heuristic"}:
+        return lambda seed: _TaggedAgent(HeuristicAgent(), trainable=False, tag="baseline:heuristic")
+    if normalized in {"baseline_scripted", "scripted"}:
+        return lambda seed: _TaggedAgent(ScriptedBootstrapAgent(), trainable=False, tag="baseline:scripted")
+    return lambda seed: _TaggedAgent(LegalRandomAgent(seed=seed), trainable=False, tag="baseline:random")
+
+
+def build_meta_mixture_factory(
+    *,
+    frozen_population: Sequence[PolicyEntry],
+    meta_strategy: MetaStrategySnapshot,
+    device: str,
+    player_id: int,
+    trainable: bool,
+    tag: str,
+    opponent_entity_key: str,
+    opponent_deck_name: str,
+    sample: bool,
+    temperature: float,
+    cache: dict[tuple[str, str], tuple[Any, Any]] | None = None,
+    inference_server: GpuInferenceServer | None = None,
+    env_config: EnvConfig | None = None,
+) -> Callable[[int], _TaggedAgent]:
+    entries = tuple(frozen_population)
+    weighted_builders: list[tuple[float, str, Callable[[int], PolicyAgent]]] = []
+    for entry in entries:
+        checkpoint_factory = build_checkpoint_agent_factory(
+            checkpoint_path=entry.checkpoint_path,
+            device=device,
+            sample=sample,
+            temperature=temperature,
+            player_id=player_id,
+            trainable=False,
+            tag=f"meta:{entry.policy_id}",
+            opponent_tag="unknown",
+            opponent_entity_key=opponent_entity_key,
+            opponent_deck_name=opponent_deck_name,
+            cache=cache,
+            inference_server=inference_server,
+            env_config=env_config,
+        )
+        weighted_builders.append(
+            (
+                float(meta_strategy.probabilities.get(entry.policy_id, 0.0)),
+                entry.policy_id,
+                lambda seed, factory=checkpoint_factory: factory(seed).inner,
+            )
+        )
+
+    def factory(seed: int) -> _TaggedAgent:
+        agent = MetaMixtureAgent(seed=seed, weighted_builders=tuple(weighted_builders))
+        return _TaggedAgent(agent, trainable=trainable, tag=tag)
+
+    return factory
+
+
+def _cached_checkpoint_bundle(
+    checkpoint_path: Path,
+    *,
+    device: str,
+    cache: dict[tuple[str, str], tuple[Any, Any]] | None = None,
+) -> tuple[Any, Any]:
+    key = (str(checkpoint_path.resolve()), device)
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        model, encoder, _ = load_ppo_deployment_checkpoint(checkpoint_path, device=device)
+    except Exception:
+        model, encoder, _, _ = load_ppo_training_checkpoint(checkpoint_path, device=device)
+    if cache is not None:
+        cache[key] = (model, encoder)
+    return model, encoder
+
+
+def _opponent_tag(kind: str, source: str) -> str:
+    return opponent_tag(kind, source)
+
+
+def _run_episode(
+    *,
+    config: EnvConfig,
+    matchup: Matchup,
+    agent0: _TaggedAgent,
+    agent1: _TaggedAgent,
+    seed: int,
+    max_decisions: int | None,
+) -> EpisodeRecord:
+    agent0.reset_history()
+    agent1.reset_history()
+    return run_event_episode(
+        config=config,
+        matchup=matchup,
+        agent0=agent0,
+        agent1=agent1,
+        seed=seed,
+        max_decisions=max_decisions,
+    )
+
+
+def _run_episode_job(
+    *,
+    config: EnvConfig,
+    max_decisions: int | None,
+    job: _EpisodeJob,
+) -> _EpisodeJobResult:
+    episode = _run_episode(
+        config=config,
+        matchup=job.matchup,
+        agent0=job.agent0_factory(job.seed),
+        agent1=job.agent1_factory(job.seed + 17),
+        seed=job.seed,
+        max_decisions=max_decisions,
+    )
+    if job.metadata:
+        episode = replace(episode, metadata={**episode.metadata, **job.metadata})
+    return _EpisodeJobResult(job=job, episode=episode)
+
+
+def _execute_episode_jobs(
+    *,
+    config: EnvConfig,
+    jobs: Sequence[_EpisodeJob],
+    max_decisions: int | None,
+    workers: int,
+    output_path: str | Path | None = None,
+    progress_callback: Callable[[int, int, _EpisodeJobResult], None] | None = None,
+) -> tuple[EpisodeRecord, ...]:
+    destination = Path(output_path) if output_path is not None else None
+    if destination is not None and destination.exists():
+        destination.unlink()
+    completed: list[_EpisodeJobResult] = []
+    total = len(jobs)
+    effective_workers = max(1, workers)
+    if effective_workers <= 1:
+        for index, job in enumerate(jobs, start=1):
+            result = _run_episode_job(config=config, max_decisions=max_decisions, job=job)
+            completed.append(result)
+            if destination is not None:
+                append_episode_records(destination, [result.episode])
+            if progress_callback is not None:
+                progress_callback(index, total, result)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    _run_episode_job,
+                    config=config,
+                    max_decisions=max_decisions,
+                    job=job,
+                )
+                for job in jobs
+            ]
+            done = 0
+            for future in as_completed(futures):
+                result = future.result()
+                completed.append(result)
+                done += 1
+                if destination is not None:
+                    append_episode_records(destination, [result.episode])
+                if progress_callback is not None:
+                    progress_callback(done, total, result)
+    completed.sort(key=lambda item: item.job.job_index)
+    return tuple(item.episode for item in completed)
+
+
+def _throughput_details(
+    *,
+    started_at: float,
+    completed_episodes: int,
+    total_steps: int,
+    inference_server: GpuInferenceServer | None,
+) -> dict[str, float]:
+    elapsed = max(1e-6, time.perf_counter() - started_at)
+    stats = inference_server.stats() if inference_server is not None else {}
+    return {
+        "episodes_per_min": (completed_episodes / elapsed) * 60.0,
+        "decisions_per_second": total_steps / elapsed,
+        "avg_inference_batch_size": float(stats.get("avg_batch_size", 1.0 if completed_episodes else 0.0)),
+    }
+
+
+def _resolve_initial_checkpoint(
+    init_checkpoint: str | Path | None,
+    state: _LoopState,
+) -> Path | None:
+    if state.working_checkpoint is not None:
+        resolved = _deployment_from_training_checkpoint(state.working_checkpoint)
+        return resolved if resolved.exists() else state.working_checkpoint
+    if init_checkpoint is None:
+        return None
+    candidate = Path(init_checkpoint)
+    if not candidate.exists():
+        return None
+    resolved = _deployment_from_training_checkpoint(candidate)
+    return resolved if resolved.exists() else candidate
+
+
+def _round_base_checkpoint(
+    *,
+    round_dir: Path,
+    fallback: Path | None,
+) -> Path | None:
+    train_artifacts = load_ppo_train_artifacts(round_dir / "train")
+    if train_artifacts is not None:
+        return Path(train_artifacts.deployment_checkpoint)
+    bootstrap_artifacts = load_ppo_train_artifacts(round_dir / "bootstrap_train")
+    if bootstrap_artifacts is not None:
+        return Path(bootstrap_artifacts.deployment_checkpoint)
+    return fallback
+
+
+def _deployment_from_training_checkpoint(training_checkpoint: str | Path) -> Path:
+    candidate = Path(training_checkpoint)
+    sibling = candidate.with_name("deployment.pt")
+    return sibling if sibling.exists() else candidate
+
+
+def _candidate_checkpoint_path(train_dir: Path, epoch: int) -> Path:
+    return train_dir / "candidates" / f"epoch_{epoch:03d}.pt"
+
+
+def _load_training_summary_payload(summary_path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(summary_path).read_text(encoding="utf-8"))
+
+
+def _candidate_epochs_from_summary(summary_payload: dict[str, Any]) -> list[int]:
+    epochs = [int(item) for item in summary_payload.get("candidate_epochs", [])]
+    if epochs:
+        return epochs
+    history = list(summary_payload.get("history", []))
+    return list(range(1, len(history) + 1))
+
+
+def _safe_candidate_epochs(summary_payload: dict[str, Any], *, max_safe_kl: float) -> list[int]:
+    safe_epochs: list[int] = []
+    history = list(summary_payload.get("history", []))
+    for epoch in _candidate_epochs_from_summary(summary_payload):
+        if epoch <= 0 or epoch > len(history):
+            continue
+        metrics = dict(history[epoch - 1])
+        if not all(math.isfinite(float(value)) for value in metrics.values()):
+            continue
+        if float(metrics.get("approx_kl", float("inf"))) <= max_safe_kl:
+            safe_epochs.append(epoch)
+    return safe_epochs
+
+
+def _shortlist_candidate_epochs(
+    summary_payload: dict[str, Any],
+    *,
+    max_safe_kl: float,
+    shortlist_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    history = list(summary_payload.get("history", []))
+    safe_epochs = _safe_candidate_epochs(summary_payload, max_safe_kl=max_safe_kl)
+    fallback_reason: str | None = None
+    if safe_epochs:
+        ranked = [
+            safe_epochs[-1],
+            min(safe_epochs, key=lambda epoch: float(history[epoch - 1]["total_loss"])),
+            min(safe_epochs, key=lambda epoch: float(history[epoch - 1]["value_loss"])),
+        ]
+    else:
+        candidate_epochs = _candidate_epochs_from_summary(summary_payload)
+        if not candidate_epochs:
+            return [], [], "no_candidate_epochs"
+        ranked = [min(candidate_epochs, key=lambda epoch: float(history[epoch - 1]["approx_kl"]))]
+        fallback_reason = "no_safe_epoch"
+    shortlist: list[int] = []
+    for epoch in ranked:
+        if epoch not in shortlist:
+            shortlist.append(epoch)
+        if len(shortlist) >= shortlist_size:
+            break
+    return shortlist, safe_epochs, fallback_reason
+
+
+def _population_entity_id(*, kind: str, source: str) -> str:
+    return shared_population_entity_id(kind=kind, source=source)
+
+def _load_loop_state(path: Path) -> _LoopState:
+    if not path.exists():
+        return _LoopState(
+            working_checkpoint=None,
+            completed_round=0,
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    working = Path(payload["working_checkpoint"]) if payload.get("working_checkpoint") else None
+    return _LoopState(
+        working_checkpoint=working if working is not None and working.exists() else None,
+        completed_round=int(payload.get("round", 0)),
+    )
+
+
+
+def _infer_resume_cursor(
+    workspace_path: Path,
+    *,
+    rounds: int,
+    initial_checkpoint: Path | None,
+    completed_round: int,
+) -> _ResumeCursor | None:
+    for round_index in range(max(1, completed_round + 1), rounds + 1):
+        round_dir = workspace_path / f"round_{round_index:04d}"
+        if not round_dir.exists():
+            phase = "bootstrap" if round_index == 1 and initial_checkpoint is None else "self_play"
+            return _ResumeCursor(round_index=round_index, phase=phase)
+        base_checkpoint = _round_base_checkpoint(
+            round_dir=round_dir,
+            fallback=initial_checkpoint,
+        )
+        if base_checkpoint is None:
+            return _ResumeCursor(round_index=round_index, phase="bootstrap")
+        if not (round_dir / "self_play.jsonl").exists() or not (round_dir / "self_play_analysis.json").exists():
+            return _ResumeCursor(round_index=round_index, phase="self_play")
+        if load_ppo_train_artifacts(round_dir / "train") is None:
+            return _ResumeCursor(round_index=round_index, phase="training")
+        if not (round_dir / "analysis.json").exists():
+            return _ResumeCursor(round_index=round_index, phase="analysis")
+    return None
+
+
+def _prepare_round_for_resume(workspace_path: Path, round_index: int, phase: str) -> None:
+    round_dir = workspace_path / f"round_{round_index:04d}"
+    if not round_dir.exists():
+        return
+    cleanup_by_phase: dict[str, tuple[str, ...]] = {
+        "bootstrap": (
+            "bootstrap.jsonl",
+            "bootstrap_analysis.json",
+            "bootstrap_train",
+            "self_play.jsonl",
+            "self_play_analysis.json",
+            "train",
+            "analysis.json",
+        ),
+        "self_play": (
+            "self_play.jsonl",
+            "self_play_analysis.json",
+            "train",
+            "analysis.json",
+        ),
+        "training": (
+            "train",
+            "analysis.json",
+        ),
+        "analysis": (
+            "analysis.json",
+        ),
+    }
+    for relative_path in cleanup_by_phase.get(phase, ()):
+        target = round_dir / relative_path
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            target.unlink()
+
+
+def _load_completed_round_results(workspace_path: Path) -> list[PpoManagedRoundResult]:
+    results: list[PpoManagedRoundResult] = []
+    for round_dir in sorted(workspace_path.glob("round_*")):
+        if not round_dir.is_dir():
+            continue
+        train_artifacts = load_ppo_train_artifacts(round_dir / "train")
+        analysis_path = round_dir / "analysis.json"
+        self_play_path = round_dir / "self_play.jsonl"
+        if train_artifacts is None or not analysis_path.exists() or not self_play_path.exists():
+            continue
+        try:
+            round_index = int(round_dir.name.split("_", maxsplit=1)[1])
+        except (IndexError, ValueError):
+            continue
+        analysis_payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+        results.append(
+            PpoManagedRoundResult(
+                round_index=round_index,
+                bootstrap_path=analysis_payload.get("bootstrap_path"),
+                self_play_path=str(self_play_path),
+                train_artifacts=train_artifacts,
+                analysis_path=str(analysis_path),
+                working_checkpoint=train_artifacts.deployment_checkpoint,
+                deployment_checkpoint=train_artifacts.deployment_checkpoint,
+            )
+        )
+    return results
+
+
+def _load_recent_replay_episodes(
+    workspace_path: Path,
+    *,
+    current_round: int,
+    replay_round_window: int = 3,
+) -> tuple[EpisodeRecord, ...]:
+    replay_episodes: list[EpisodeRecord] = []
+    round_start = max(1, current_round - replay_round_window)
+    for round_index in range(round_start, current_round):
+        self_play_path = workspace_path / f"round_{round_index:04d}" / "self_play.jsonl"
+        if not self_play_path.exists():
+            continue
+        replay_episodes.extend(load_episode_records(self_play_path))
+    return tuple(replay_episodes)
+
+
+def _load_recent_p2sro_replay_episodes(
+    workspace_path: Path,
+    *,
+    current_round: int,
+    replay_round_window: int = 3,
+) -> tuple[EpisodeRecord, ...]:
+    replay_episodes: list[EpisodeRecord] = []
+    round_start = max(1, current_round - replay_round_window)
+    for round_index in range(round_start, current_round):
+        for relative_path in ("self_play.jsonl", "br_self_play.jsonl"):
+            path = workspace_path / f"round_{round_index:04d}" / relative_path
+            if path.exists():
+                replay_episodes.extend(load_episode_records(path))
+    return tuple(replay_episodes)
+
+
+def collect_bootstrap_episodes(
+    *,
+    config: EnvConfig,
+    matchups: Sequence[Matchup],
+    episodes_per_matchup: int,
+    seed_start: int,
+    max_decisions: int | None,
+    output_path: str | Path,
+    workers: int = 1,
+    progress_callback: BootstrapProgressCallback | None = None,
+) -> tuple[EpisodeRecord, ...]:
+    scripted_mirror = max(1, episodes_per_matchup // 2)
+    scripted_vs_random = max(0, episodes_per_matchup - scripted_mirror)
+    jobs: list[_EpisodeJob] = []
+    total = len(matchups) * (scripted_mirror + scripted_vs_random)
+    for matchup_index, matchup in enumerate(matchups):
+        for local_index in range(scripted_mirror):
+            seed = seed_start + matchup_index * episodes_per_matchup + local_index
+            jobs.append(
+                _EpisodeJob(
+                    job_index=len(jobs),
+                    matchup=matchup,
+                    seed=seed,
+                    agent0_factory=lambda _seed: _TaggedAgent(
+                        ScriptedBootstrapAgent(),
+                        trainable=True,
+                        tag="bootstrap_scripted",
+                    ),
+                    agent1_factory=lambda _seed: _TaggedAgent(
+                        ScriptedBootstrapAgent(),
+                        trainable=True,
+                        tag="bootstrap_scripted",
+                    ),
+                    metadata={},
+                )
+            )
+        for local_index in range(scripted_vs_random):
+            seed = seed_start + matchup_index * episodes_per_matchup + scripted_mirror + local_index
+            jobs.append(
+                _EpisodeJob(
+                    job_index=len(jobs),
+                    matchup=matchup,
+                    seed=seed,
+                    agent0_factory=lambda _seed: _TaggedAgent(
+                        ScriptedBootstrapAgent(),
+                        trainable=True,
+                        tag="bootstrap_scripted",
+                    ),
+                    agent1_factory=lambda inner_seed: _TaggedAgent(
+                        LegalRandomAgent(seed=inner_seed),
+                        trainable=False,
+                        tag="bootstrap_random",
+                    ),
+                    metadata={},
+                )
+            )
+
+    def callback(done: int, all_jobs: int, result: _EpisodeJobResult) -> None:
+        if progress_callback is not None:
+            progress_callback(done, total, result.episode)
+
+    return _execute_episode_jobs(
+        config=config,
+        jobs=jobs,
+        max_decisions=max_decisions,
+        workers=workers,
+        output_path=output_path,
+        progress_callback=callback,
+    )
+
+
+
+
+def _payoff_from_counts(*, wins: int, losses: int, draws: int, episodes: int) -> float:
+    if episodes <= 0:
+        return 0.0
+    return float(wins - losses - draws) / float(episodes)
+
+
+def collect_p2sro_training_episodes(
+    *,
+    config: EnvConfig,
+    current_checkpoint: str | Path,
+    frozen_population: Sequence[PolicyEntry],
+    meta_strategy: MetaStrategySnapshot,
+    matchups: Sequence[Matchup],
+    episodes_per_matchup: int,
+    seed_start: int,
+    max_decisions: int | None,
+    device: str,
+    output_path: str | Path,
+    workers: int = 1,
+    inference_server: GpuInferenceServer | None = None,
+    progress_callback: SelfPlayProgressCallback | None = None,
+) -> tuple[EpisodeRecord, ...]:
+    cache: dict[tuple[str, str], tuple[Any, Any]] = {}
+    total = len(matchups) * episodes_per_matchup
+    jobs: list[_EpisodeJob] = []
+    frozen_entries = tuple(frozen_population)
+    if not frozen_entries:
+        raise RuntimeError("P2SRO training requires a non-empty frozen population")
+    temp_manager = P2SROManager(state_path=Path("."), frozen_population={entry.policy_id: entry for entry in frozen_entries})
+    temp_manager.meta_strategy = meta_strategy
+    for matchup_index, matchup in enumerate(matchups):
+        for local_index in range(episodes_per_matchup):
+            seed = seed_start + matchup_index * episodes_per_matchup + local_index
+            opponent_entry = temp_manager.sample_policy(seed=seed)
+            jobs.append(
+                _EpisodeJob(
+                    job_index=len(jobs),
+                    matchup=matchup,
+                    seed=seed,
+                    agent0_factory=build_checkpoint_agent_factory(
+                        checkpoint_path=current_checkpoint,
+                        device=device,
+                        sample=True,
+                        temperature=1.0,
+                        player_id=0,
+                        trainable=True,
+                        tag="active_slot",
+                        opponent_tag="meta_population",
+                        opponent_entity_key=opponent_entry.policy_id,
+                        opponent_deck_name=matchup.deck1,
+                        cache=cache,
+                        inference_server=inference_server,
+                        env_config=config,
+                    ),
+                    agent1_factory=build_opponent_factory(
+                        "current",
+                        opponent_entry.checkpoint_path,
+                        device=device,
+                        sample=True,
+                        temperature=1.0,
+                        opponent_entity_key="active_slot",
+                        opponent_deck_name=matchup.deck0,
+                        observed_opponent_tag="active_population_slot",
+                        cache=cache,
+                        inference_server=inference_server,
+                        env_config=config,
+                    ),
+                    metadata={
+                        "opponent_kind": "frozen_population",
+                        "opponent_policy_id": opponent_entry.policy_id,
+                        "opponent_source": opponent_entry.checkpoint_path,
+                        "matchup": matchup.key,
+                    },
+                )
+            )
+
+    def callback(done: int, all_jobs: int, result: _EpisodeJobResult) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                done,
+                total,
+                result.episode,
+                f"frozen:{result.job.metadata['opponent_policy_id']}",
+            )
+
+    return _execute_episode_jobs(
+        config=config,
+        jobs=jobs,
+        max_decisions=max_decisions,
+        workers=workers,
+        output_path=output_path,
+        progress_callback=callback,
+    )
+
+
+def _evaluate_checkpoint_against_population(
+    *,
+    checkpoint_path: Path,
+    frozen_population: Sequence[PolicyEntry],
+    meta_strategy: MetaStrategySnapshot,
+    env_config: EnvConfig,
+    matchups: Sequence[Matchup],
+    device: str,
+    max_decisions: int | None,
+    workers: int,
+    cache: dict[tuple[str, str], tuple[Any, Any]],
+    inference_server: GpuInferenceServer | None,
+    episodes_per_matchup: int,
+    seed_start: int,
+) -> tuple[float, dict[str, float], tuple[dict[str, object], ...]]:
+    per_policy_payoffs: dict[str, float] = {}
+    matchup_payloads: list[dict[str, object]] = []
+    meta_expected_payoff = 0.0
+    for policy_index, opponent_entry in enumerate(frozen_population):
+        jobs: list[_EpisodeJob] = []
+        for episode_index in range(episodes_per_matchup):
+            for matchup_index, matchup in enumerate(matchups):
+                seed = (
+                    seed_start
+                    + policy_index * 10_000
+                    + matchup_index * episodes_per_matchup
+                    + episode_index
+                )
+                jobs.append(
+                    _EpisodeJob(
+                        job_index=len(jobs),
+                        matchup=matchup,
+                        seed=seed,
+                        agent0_factory=build_checkpoint_agent_factory(
+                            checkpoint_path=checkpoint_path,
+                            device=device,
+                            sample=False,
+                            temperature=1.0,
+                            player_id=0,
+                            trainable=False,
+                            tag="candidate_eval",
+                            opponent_tag="frozen_population",
+                            opponent_entity_key=opponent_entry.policy_id,
+                            opponent_deck_name=matchup.deck1,
+                            cache=cache,
+                            inference_server=inference_server,
+                            env_config=env_config,
+                        ),
+                        agent1_factory=build_opponent_factory(
+                            "current",
+                            opponent_entry.checkpoint_path,
+                            device=device,
+                            sample=False,
+                            temperature=1.0,
+                            opponent_entity_key="candidate_eval",
+                            opponent_deck_name=matchup.deck0,
+                            observed_opponent_tag="active_population_slot",
+                            cache=cache,
+                            inference_server=inference_server,
+                            env_config=env_config,
+                        ),
+                        metadata={
+                            "opponent_policy_id": opponent_entry.policy_id,
+                            "opponent_source": opponent_entry.checkpoint_path,
+                            "matchup": matchup.key,
+                        },
+                    )
+                )
+        episodes = _execute_episode_jobs(
+            config=env_config,
+            jobs=jobs,
+            max_decisions=max_decisions,
+            workers=workers,
+        )
+        wins = sum(1 for episode in episodes if episode.winner == 0)
+        losses = sum(1 for episode in episodes if episode.winner == 1)
+        draws = sum(1 for episode in episodes if episode.winner not in {0, 1})
+        payoff = _payoff_from_counts(
+            wins=wins,
+            losses=losses,
+            draws=draws,
+            episodes=len(episodes),
+        )
+        per_policy_payoffs[opponent_entry.policy_id] = payoff
+        meta_expected_payoff += float(meta_strategy.probabilities.get(opponent_entry.policy_id, 0.0)) * payoff
+        for matchup in matchups:
+            matchup_episodes = tuple(episode for episode in episodes if episode.matchup == matchup.key)
+            matchup_wins = sum(1 for episode in matchup_episodes if episode.winner == 0)
+            matchup_losses = sum(1 for episode in matchup_episodes if episode.winner == 1)
+            matchup_draws = sum(1 for episode in matchup_episodes if episode.winner not in {0, 1})
+            matchup_payloads.append(
+                {
+                    "opponent_policy_id": opponent_entry.policy_id,
+                    "matchup": matchup.key,
+                    "episodes": len(matchup_episodes),
+                    "wins": matchup_wins,
+                    "losses": matchup_losses,
+                    "draws": matchup_draws,
+                    "payoff": _payoff_from_counts(
+                        wins=matchup_wins,
+                        losses=matchup_losses,
+                        draws=matchup_draws,
+                        episodes=len(matchup_episodes),
+                    ),
+                }
+            )
+    return meta_expected_payoff, per_policy_payoffs, tuple(matchup_payloads)
+
+
+def _select_active_slot_checkpoint(
+    *,
+    train_dir: Path,
+    train_artifacts: PpoTrainArtifacts,
+    env_config: EnvConfig,
+    matchups: Sequence[Matchup],
+    device: str,
+    max_decisions: int | None,
+    seed_start: int,
+    benchmark_config: BenchmarkConfig,
+    frozen_population: Sequence[PolicyEntry],
+    meta_strategy: MetaStrategySnapshot,
+    workers: int,
+    inference_server: GpuInferenceServer | None,
+    enable_status_print: bool,
+) -> tuple[Path, int, Path, _SlotCandidateEvaluation]:
+    summary_payload = _load_training_summary_payload(train_artifacts.summary_path)
+    shortlist_epochs, safe_epochs, fallback_reason = _shortlist_candidate_epochs(
+        summary_payload,
+        max_safe_kl=benchmark_config.max_safe_kl,
+        shortlist_size=benchmark_config.shortlist_size,
+    )
+    if not shortlist_epochs:
+        raise RuntimeError("no checkpoint candidates available for active slot selection")
+    cache: dict[tuple[str, str], tuple[Any, Any]] = {}
+    candidates: list[_SlotCandidateEvaluation] = []
+    for epoch in shortlist_epochs:
+        checkpoint_path = _candidate_checkpoint_path(train_dir, epoch)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"candidate checkpoint missing: {checkpoint_path}")
+        expected_payoff, per_policy_payoffs, matchup_payloads = _evaluate_checkpoint_against_population(
+            checkpoint_path=checkpoint_path,
+            frozen_population=frozen_population,
+            meta_strategy=meta_strategy,
+            env_config=env_config,
+            matchups=matchups,
+            device=device,
+            max_decisions=max_decisions,
+            workers=workers,
+            cache=cache,
+            inference_server=inference_server,
+            episodes_per_matchup=benchmark_config.episodes_per_matchup,
+            seed_start=seed_start + epoch * 1_000,
+        )
+        candidate = _SlotCandidateEvaluation(
+            epoch=epoch,
+            checkpoint_path=str(checkpoint_path),
+            expected_payoff_vs_meta=expected_payoff,
+            matchup_results=matchup_payloads,
+            per_policy_payoffs=per_policy_payoffs,
+            meta_policy_probabilities=dict(meta_strategy.probabilities),
+        )
+        candidates.append(candidate)
+        if enable_status_print:
+            print(
+                "[p2sro-selection] "
+                f"epoch={epoch} "
+                f"expected_payoff_vs_meta={expected_payoff:.4f}",
+                flush=True,
+            )
+    selected = max(candidates, key=lambda item: (item.expected_payoff_vs_meta, item.epoch))
+    deployment_checkpoint = Path(train_artifacts.deployment_checkpoint)
+    selected_source = Path(selected.checkpoint_path)
+    if selected_source.resolve() != deployment_checkpoint.resolve():
+        shutil.copy2(selected_source, deployment_checkpoint)
+    selected = replace(selected, checkpoint_path=str(deployment_checkpoint))
+    selection_summary_path = train_dir / "selection_summary.json"
+    atomic_write_json(
+        selection_summary_path,
+        {
+            "selection_method": "expected_payoff_vs_meta",
+            "safe_epochs": safe_epochs,
+            "shortlist_epochs": shortlist_epochs,
+            "fallback_reason": fallback_reason,
+            "selected_epoch": selected.epoch,
+            "selected_checkpoint": selected.checkpoint_path,
+            "expected_payoff_vs_meta": selected.expected_payoff_vs_meta,
+            "meta_policy_probabilities": dict(selected.meta_policy_probabilities),
+            "candidates": [
+                {
+                    "epoch": item.epoch,
+                    "checkpoint_path": item.checkpoint_path,
+                    "expected_payoff_vs_meta": item.expected_payoff_vs_meta,
+                    "per_policy_payoffs": dict(item.per_policy_payoffs),
+                    "matchup_results": [dict(result) for result in item.matchup_results],
+                }
+                for item in candidates
+            ],
+        },
+    )
+    return deployment_checkpoint, selected.epoch, selection_summary_path, selected
+
+
+def _update_p2sro_payoff_matrix(
+    *,
+    manager: P2SROManager,
+    candidate_policy_id: str,
+    candidate_checkpoint: Path,
+    env_config: EnvConfig,
+    matchups: Sequence[Matchup],
+    device: str,
+    max_decisions: int | None,
+    workers: int,
+    inference_server: GpuInferenceServer | None,
+    episodes_per_matchup: int,
+    seed_start: int,
+) -> dict[str, float]:
+    cache: dict[tuple[str, str], tuple[Any, Any]] = {}
+    per_policy_payoffs: dict[str, float] = {}
+    for opponent_index, opponent_entry in enumerate(manager.frozen_entries()):
+        jobs: list[_EpisodeJob] = []
+        per_matchup_results: list[dict[str, object]] = []
+        for episode_index in range(episodes_per_matchup):
+            for matchup_index, matchup in enumerate(matchups):
+                seed = (
+                    seed_start
+                    + opponent_index * 10_000
+                    + matchup_index * episodes_per_matchup
+                    + episode_index
+                )
+                jobs.append(
+                    _EpisodeJob(
+                        job_index=len(jobs),
+                        matchup=matchup,
+                        seed=seed,
+                        agent0_factory=build_checkpoint_agent_factory(
+                            checkpoint_path=candidate_checkpoint,
+                            device=device,
+                            sample=False,
+                            temperature=1.0,
+                            player_id=0,
+                            trainable=False,
+                            tag=f"payoff:{candidate_policy_id}",
+                            opponent_tag="frozen_population",
+                            opponent_entity_key=opponent_entry.policy_id,
+                            opponent_deck_name=matchup.deck1,
+                            cache=cache,
+                            inference_server=inference_server,
+                            env_config=env_config,
+                        ),
+                        agent1_factory=build_opponent_factory(
+                            "current",
+                            opponent_entry.checkpoint_path,
+                            device=device,
+                            sample=False,
+                            temperature=1.0,
+                            opponent_entity_key=candidate_policy_id,
+                            opponent_deck_name=matchup.deck0,
+                            observed_opponent_tag="active_population_slot",
+                            cache=cache,
+                            inference_server=inference_server,
+                            env_config=env_config,
+                        ),
+                        metadata={
+                            "candidate_policy_id": candidate_policy_id,
+                            "opponent_policy_id": opponent_entry.policy_id,
+                            "matchup": matchup.key,
+                        },
+                    )
+                )
+        episodes = _execute_episode_jobs(
+            config=env_config,
+            jobs=jobs,
+            max_decisions=max_decisions,
+            workers=workers,
+        )
+        wins = sum(1 for episode in episodes if episode.winner == 0)
+        losses = sum(1 for episode in episodes if episode.winner == 1)
+        draws = sum(1 for episode in episodes if episode.winner not in {0, 1})
+        candidate_payoff = _payoff_from_counts(
+            wins=wins,
+            losses=losses,
+            draws=draws,
+            episodes=len(episodes),
+        )
+        per_policy_payoffs[opponent_entry.policy_id] = candidate_payoff
+        for matchup in matchups:
+            matchup_episodes = tuple(episode for episode in episodes if episode.matchup == matchup.key)
+            matchup_wins = sum(1 for episode in matchup_episodes if episode.winner == 0)
+            matchup_losses = sum(1 for episode in matchup_episodes if episode.winner == 1)
+            matchup_draws = sum(1 for episode in matchup_episodes if episode.winner not in {0, 1})
+            per_matchup_results.append(
+                {
+                    "matchup": matchup.key,
+                    "episodes": len(matchup_episodes),
+                    "wins": matchup_wins,
+                    "losses": matchup_losses,
+                    "draws": matchup_draws,
+                    "payoff": _payoff_from_counts(
+                        wins=matchup_wins,
+                        losses=matchup_losses,
+                        draws=matchup_draws,
+                        episodes=len(matchup_episodes),
+                    ),
+                }
+            )
+        opponent_payoff = _payoff_from_counts(
+            wins=losses,
+            losses=wins,
+            draws=draws,
+            episodes=len(episodes),
+        )
+        manager.payoff_matrix.set_pair(
+            row_policy_id=candidate_policy_id,
+            col_policy_id=opponent_entry.policy_id,
+            row_result=PayoffResult(
+                episodes=len(episodes),
+                wins=wins,
+                losses=losses,
+                draws=draws,
+                payoff=candidate_payoff,
+                matchup_results=tuple(per_matchup_results),
+            ),
+            col_result=PayoffResult(
+                episodes=len(episodes),
+                wins=losses,
+                losses=wins,
+                draws=draws,
+                payoff=opponent_payoff,
+                matchup_results=tuple(
+                    {
+                        "matchup": item["matchup"],
+                        "episodes": item["episodes"],
+                        "wins": item["losses"],
+                        "losses": item["wins"],
+                        "draws": item["draws"],
+                        "payoff": _payoff_from_counts(
+                            wins=int(item["losses"]),
+                            losses=int(item["wins"]),
+                            draws=int(item["draws"]),
+                            episodes=int(item["episodes"]),
+                        ),
+                    }
+                    for item in per_matchup_results
+                ),
+            ),
+        )
+    return per_policy_payoffs
+
+
+
+
+
+
+
+def run_ppo_managed_loop(
+    *,
+    workspace: str | Path,
+    rounds: int = 20,
+    init_checkpoint: str | Path | None = None,
+    bootstrap_episodes_per_matchup: int = 8,
+    self_play_episodes_per_matchup: int = 8,
+    max_rounds: int = 15,
+    max_decisions: int | None = 512,
+    draw_penalty: float = 1.0,
+    batch_size: int = 64,
+    micro_batch_size: int | None = None,
+    epochs: int = 12,
+    bootstrap_epochs: int = 5,
+    learning_rate: float = 1.0e-3,
+    weight_decay: float = 1e-4,
+    grad_clip_norm: float | None = 1.0,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    policy_coef: float = 4.0,
+    value_coef: float = 0.5,
+    belief_coef: float = 0.2,
+    oracle_coef: float = 0.2,
+    reference_kl_coef: float = 0.005,
+    target_kl_low: float = 0.01,
+    target_kl_high: float = 0.05,
+    use_amp: bool | None = None,
+    device: str = "auto",
+    workers: int = 8,
+    inference_max_batch_size: int = 128,
+    inference_max_wait_ms: int = 2,
+    seed_start: int = 0,
+    resume: bool = True,
+    enable_status_print: bool = True,
+    retain_round_directories: int | None = 6,
+    benchmark_config: BenchmarkConfig | None = None,
+    checkpoint_selection_config: BenchmarkConfig | None = None,
+    p2sro_config: P2SROConfig | None = None,
+    matchups: tuple[Matchup, ...] = SMALL_DECK_MATCHUPS,
+) -> PpoManagedLoopArtifacts:
+    workspace_path = Path(workspace)
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    status_path = workspace_path / "event_loop_status.json"
+    history_path = workspace_path / "event_loop_history.jsonl"
+    state_path = workspace_path / "event_loop_state.json"
+    manifest_path = workspace_path / "run_manifest.json"
+    result_path = workspace_path / "event_loop_result.json"
+    deployment_manifest_path = workspace_path / "meta_deployment.json"
+    p2sro_state_path = workspace_path / "p2sro_state.json"
+    write_runtime_manifest(manifest_path, workspace=workspace_path)
+    tracker = ProgressTracker(
+        status_path=status_path,
+        event_log_path=history_path,
+        overall_total_units=max(1, rounds * 4),
+        worker_count=max(1, workers),
+        enable_print=enable_status_print,
+    )
+    state = _load_loop_state(state_path) if resume else _LoopState(
+        working_checkpoint=None,
+        completed_round=0,
+    )
+    start_round = max(1, state.completed_round + 1)
+    current_training_checkpoint = _resolve_initial_checkpoint(init_checkpoint, state)
+    resolved_device = auto_device(device)
+    resolved_benchmark_config = benchmark_config or checkpoint_selection_config or BenchmarkConfig()
+    env_config = EnvConfig(
+        deck_pool=SMALL_DECK_POOL,
+        max_rounds=max_rounds,
+        record_full_state_json=True,
+        record_player_view=True,
+        draw_penalty=draw_penalty,
+    )
+    manager = P2SROManager.load(p2sro_state_path, config=p2sro_config or P2SROConfig())
+    round_results = _load_completed_round_results(workspace_path)
+    resolved_workers = _recommended_rollout_workers(max(1, workers), current_training_checkpoint)
+    inference_server = (
+        GpuInferenceServer(
+            device=resolved_device,
+            config=InferenceServerConfig(
+                max_batch_size=inference_max_batch_size,
+                max_wait_ms=inference_max_wait_ms,
+            ),
+        )
+        if resolved_workers > 1
+        else None
+    )
+    for round_index in range(start_round, rounds + 1):
+        round_dir = workspace_path / f"round_{round_index:04d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        bootstrap_path = round_dir / "bootstrap.jsonl"
+        bootstrap_analysis_path = round_dir / "bootstrap_analysis.json"
+        bootstrap_train_dir = round_dir / "bootstrap_train"
+        self_play_path = round_dir / "self_play.jsonl"
+        self_play_analysis_path = round_dir / "self_play_analysis.json"
+        train_dir = round_dir / "train"
+        br_self_play_path = round_dir / "br_self_play.jsonl"
+        br_self_play_analysis_path = round_dir / "br_self_play_analysis.json"
+        br_train_dir = round_dir / "br_train"
+        analysis_path = round_dir / "analysis.json"
+        round_base_checkpoint = current_training_checkpoint
+        if round_base_checkpoint is None:
+            total_bootstrap = len(matchups) * bootstrap_episodes_per_matchup
+            tracker.start_phase(
+                "bootstrap",
+                total_units=total_bootstrap,
+                current_task=f"round_{round_index:04d}",
+                overall_completed_units=(round_index - 1) * 5,
+                artifacts={"bootstrap_path": str(bootstrap_path)},
+            )
+            bootstrap_episodes = collect_bootstrap_episodes(
+                config=env_config,
+                matchups=matchups,
+                episodes_per_matchup=bootstrap_episodes_per_matchup,
+                seed_start=seed_start + (round_index * 100_000),
+                max_decisions=max_decisions,
+                output_path=bootstrap_path,
+                workers=resolved_workers,
+            )
+            bootstrap_analysis = analyze_episode_records(bootstrap_episodes, player=0)
+            write_episode_analysis(
+                bootstrap_analysis_path,
+                phase="bootstrap",
+                round_index=round_index,
+                analytics=bootstrap_analysis,
+            )
+            bootstrap_artifacts = bootstrap_pretrain_from_episodes(
+                episodes=bootstrap_episodes,
+                output_dir=bootstrap_train_dir,
+                init_checkpoint=None,
+                device=resolved_device,
+                batch_size=batch_size,
+                micro_batch_size=micro_batch_size,
+                epochs=bootstrap_epochs,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                grad_clip_norm=grad_clip_norm,
+                use_amp=use_amp,
+                progress_callback=None,
+            )
+            round_base_checkpoint = Path(bootstrap_artifacts.deployment_checkpoint)
+            tracker.complete_phase(
+                "bootstrap",
+                total_units=total_bootstrap,
+                current_task=f"round_{round_index:04d}",
+                overall_completed_units=(round_index - 1) * 5 + 1,
+                artifacts={
+                    "bootstrap_path": str(bootstrap_path),
+                    "bootstrap_train_dir": str(bootstrap_train_dir),
+                },
+                details={
+                    "episodes": bootstrap_analysis.episodes,
+                    "player0_wins": bootstrap_analysis.player0_wins,
+                    "player1_wins": bootstrap_analysis.player1_wins,
+                    "draws": bootstrap_analysis.draws,
+                },
+            )
+
+        assert round_base_checkpoint is not None
+        main_seed_checkpoint = _deployment_from_training_checkpoint(round_base_checkpoint)
+        if not main_seed_checkpoint.exists():
+            raise FileNotFoundError(f"missing active main seed checkpoint: {main_seed_checkpoint}")
+        seed_entry = manager.initialize_seed_population(
+            seed_checkpoint_path=str(main_seed_checkpoint),
+            round_index=round_index,
+        )
+        meta_snapshot = manager.recompute_meta_strategy()
+        manager.set_active_slot_seed(
+            slot_name="active_main_slot",
+            lineage="main",
+            checkpoint_path=str(main_seed_checkpoint),
+            seed_policy_id=seed_entry.policy_id,
+            parent_policy_id=seed_entry.policy_id,
+        )
+        tracker.start_phase(
+            "active_main_slot",
+            total_units=(len(matchups) * self_play_episodes_per_matchup) + epochs,
+            current_task=f"round_{round_index:04d}",
+            overall_completed_units=(round_index - 1) * 5 + 1,
+            artifacts={"self_play_path": str(self_play_path), "train_dir": str(train_dir)},
+        )
+        self_play_episodes = collect_p2sro_training_episodes(
+            config=env_config,
+            current_checkpoint=main_seed_checkpoint,
+            frozen_population=manager.frozen_entries(),
+            meta_strategy=meta_snapshot,
+            matchups=matchups,
+            episodes_per_matchup=self_play_episodes_per_matchup,
+            seed_start=seed_start + round_index * 10_000,
+            max_decisions=max_decisions,
+            device=resolved_device,
+            output_path=self_play_path,
+            workers=resolved_workers,
+            inference_server=inference_server,
+        )
+        self_play_analysis = analyze_episode_records(self_play_episodes, player=0)
+        write_episode_analysis(
+            self_play_analysis_path,
+            phase="self_play",
+            round_index=round_index,
+            analytics=self_play_analysis,
+        )
+        replay_episodes = _load_recent_p2sro_replay_episodes(
+            workspace_path,
+            current_round=round_index,
+            replay_round_window=3,
+        )
+        main_train_artifacts = train_ppo_from_episodes(
+            episodes=self_play_episodes,
+            replay_episodes=replay_episodes,
+            output_dir=train_dir,
+            init_checkpoint=main_seed_checkpoint,
+            env_config=env_config,
+            device=resolved_device,
+            batch_size=batch_size,
+            micro_batch_size=micro_batch_size,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            grad_clip_norm=grad_clip_norm,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            entropy_coef=entropy_coef,
+            policy_coef=policy_coef,
+            value_coef=value_coef,
+            belief_coef=belief_coef,
+            oracle_coef=oracle_coef,
+            reference_kl_coef=reference_kl_coef,
+            target_kl_low=target_kl_low,
+            target_kl_high=target_kl_high,
+            use_amp=use_amp,
+            progress_callback=None,
+        )
+        selected_main_checkpoint, selected_main_epoch, main_selection_path, selected_main_candidate = _select_active_slot_checkpoint(
+            train_dir=train_dir,
+            train_artifacts=main_train_artifacts,
+            env_config=env_config,
+            matchups=matchups,
+            device=resolved_device,
+            max_decisions=max_decisions,
+            seed_start=seed_start + round_index * 30_000,
+            benchmark_config=resolved_benchmark_config,
+            frozen_population=manager.frozen_entries(),
+            meta_strategy=meta_snapshot,
+            workers=resolved_workers,
+            inference_server=inference_server,
+            enable_status_print=enable_status_print,
+        )
+        main_slot_state = manager.update_active_slot_result(
+            slot_name="active_main_slot",
+            selected_epoch=selected_main_epoch,
+            selected_checkpoint_path=str(selected_main_checkpoint),
+            expected_payoff_vs_meta=selected_main_candidate.expected_payoff_vs_meta,
+        )
+        tracker.complete_phase(
+            "active_main_slot",
+            total_units=(len(matchups) * self_play_episodes_per_matchup) + epochs,
+            current_task=f"round_{round_index:04d}",
+            overall_completed_units=(round_index - 1) * 5 + 2,
+            artifacts={
+                "self_play_path": str(self_play_path),
+                "train_dir": str(train_dir),
+                "selection_path": str(main_selection_path),
+            },
+            details={
+                "selected_epoch": selected_main_epoch,
+                "selected_checkpoint": str(selected_main_checkpoint),
+                "expected_payoff_vs_meta": selected_main_candidate.expected_payoff_vs_meta,
+            },
+        )
+        manager.set_active_slot_seed(
+            slot_name="active_br_slot",
+            lineage="best_response",
+            checkpoint_path=str(selected_main_checkpoint),
+            seed_policy_id=main_slot_state.seed_policy_id,
+            parent_policy_id=main_slot_state.parent_policy_id,
+        )
+        tracker.start_phase(
+            "active_br_slot",
+            total_units=(len(matchups) * self_play_episodes_per_matchup) + epochs,
+            current_task=f"round_{round_index:04d}",
+            overall_completed_units=(round_index - 1) * 5 + 2,
+            artifacts={"self_play_path": str(br_self_play_path), "train_dir": str(br_train_dir)},
+        )
+        br_self_play_episodes = collect_p2sro_training_episodes(
+            config=env_config,
+            current_checkpoint=selected_main_checkpoint,
+            frozen_population=manager.frozen_entries(),
+            meta_strategy=meta_snapshot,
+            matchups=matchups,
+            episodes_per_matchup=self_play_episodes_per_matchup,
+            seed_start=seed_start + round_index * 20_000,
+            max_decisions=max_decisions,
+            device=resolved_device,
+            output_path=br_self_play_path,
+            workers=resolved_workers,
+            inference_server=inference_server,
+        )
+        br_self_play_analysis = analyze_episode_records(br_self_play_episodes, player=0)
+        write_episode_analysis(
+            br_self_play_analysis_path,
+            phase="br_self_play",
+            round_index=round_index,
+            analytics=br_self_play_analysis,
+        )
+        br_replay_episodes = tuple(replay_episodes) + tuple(self_play_episodes)
+        br_train_artifacts = train_ppo_from_episodes(
+            episodes=br_self_play_episodes,
+            replay_episodes=br_replay_episodes,
+            output_dir=br_train_dir,
+            init_checkpoint=selected_main_checkpoint,
+            env_config=env_config,
+            device=resolved_device,
+            batch_size=batch_size,
+            micro_batch_size=micro_batch_size,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            grad_clip_norm=grad_clip_norm,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            entropy_coef=entropy_coef,
+            policy_coef=policy_coef,
+            value_coef=value_coef,
+            belief_coef=belief_coef,
+            oracle_coef=oracle_coef,
+            reference_kl_coef=reference_kl_coef,
+            target_kl_low=target_kl_low,
+            target_kl_high=target_kl_high,
+            use_amp=use_amp,
+            progress_callback=None,
+        )
+        selected_br_checkpoint, selected_br_epoch, br_selection_path, selected_br_candidate = _select_active_slot_checkpoint(
+            train_dir=br_train_dir,
+            train_artifacts=br_train_artifacts,
+            env_config=env_config,
+            matchups=matchups,
+            device=resolved_device,
+            max_decisions=max_decisions,
+            seed_start=seed_start + round_index * 40_000,
+            benchmark_config=resolved_benchmark_config,
+            frozen_population=manager.frozen_entries(),
+            meta_strategy=meta_snapshot,
+            workers=resolved_workers,
+            inference_server=inference_server,
+            enable_status_print=enable_status_print,
+        )
+        br_slot_state = manager.update_active_slot_result(
+            slot_name="active_br_slot",
+            selected_epoch=selected_br_epoch,
+            selected_checkpoint_path=str(selected_br_checkpoint),
+            expected_payoff_vs_meta=selected_br_candidate.expected_payoff_vs_meta,
+        )
+        tracker.complete_phase(
+            "active_br_slot",
+            total_units=(len(matchups) * self_play_episodes_per_matchup) + epochs,
+            current_task=f"round_{round_index:04d}",
+            overall_completed_units=(round_index - 1) * 5 + 3,
+            artifacts={
+                "self_play_path": str(br_self_play_path),
+                "train_dir": str(br_train_dir),
+                "selection_path": str(br_selection_path),
+            },
+            details={
+                "selected_epoch": selected_br_epoch,
+                "selected_checkpoint": str(selected_br_checkpoint),
+                "expected_payoff_vs_meta": selected_br_candidate.expected_payoff_vs_meta,
+            },
+        )
+        promoted_entries: list[PolicyEntry] = []
+        if manager.should_promote(lineage="main", candidate_payoff=selected_main_candidate.expected_payoff_vs_meta):
+            promoted_main = manager.freeze_active_slot(
+                slot_name="active_main_slot",
+                round_index=round_index,
+            )
+            _update_p2sro_payoff_matrix(
+                manager=manager,
+                candidate_policy_id=promoted_main.policy_id,
+                candidate_checkpoint=selected_main_checkpoint,
+                env_config=env_config,
+                matchups=matchups,
+                device=resolved_device,
+                max_decisions=max_decisions,
+                workers=resolved_workers,
+                inference_server=inference_server,
+                episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
+                seed_start=seed_start + round_index * 50_000,
+            )
+            promoted_entries.append(promoted_main)
+        if manager.should_promote(lineage="best_response", candidate_payoff=selected_br_candidate.expected_payoff_vs_meta):
+            promoted_br = manager.freeze_active_slot(
+                slot_name="active_br_slot",
+                round_index=round_index,
+            )
+            _update_p2sro_payoff_matrix(
+                manager=manager,
+                candidate_policy_id=promoted_br.policy_id,
+                candidate_checkpoint=selected_br_checkpoint,
+                env_config=env_config,
+                matchups=matchups,
+                device=resolved_device,
+                max_decisions=max_decisions,
+                workers=resolved_workers,
+                inference_server=inference_server,
+                episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
+                seed_start=seed_start + round_index * 60_000,
+            )
+            promoted_entries.append(promoted_br)
+        meta_snapshot = manager.recompute_meta_strategy()
+        manager.save()
+        atomic_write_json(
+            deployment_manifest_path,
+            {
+                "round": round_index,
+                "frozen_population": [entry.to_dict() for entry in manager.frozen_entries()],
+                "meta_strategy": meta_snapshot.to_dict(),
+                "active_main_slot": main_slot_state.to_dict(),
+                "active_br_slot": br_slot_state.to_dict(),
+            },
+        )
+        analysis_payload = {
+            "round": round_index,
+            "algorithm": "p2sro",
+            "bootstrap_path": str(bootstrap_path) if bootstrap_path.exists() else None,
+            "self_play_path": str(self_play_path),
+            "br_self_play_path": str(br_self_play_path),
+            "train_dir": str(train_dir),
+            "br_train_dir": str(br_train_dir),
+            "main_training_checkpoint": main_train_artifacts.training_checkpoint,
+            "br_training_checkpoint": br_train_artifacts.training_checkpoint,
+            "working_checkpoint": str(selected_main_checkpoint),
+            "deployment_checkpoint": str(deployment_manifest_path),
+            "meta_strategy_path": str(deployment_manifest_path),
+            "frozen_population": [entry.to_dict() for entry in manager.frozen_entries()],
+            "meta_probabilities": dict(meta_snapshot.probabilities),
+            "meta_expected_utilities": dict(meta_snapshot.expected_utilities),
+            "meta_support_set": list(meta_snapshot.support_set),
+            "active_main_slot": main_slot_state.to_dict(),
+            "active_br_slot": br_slot_state.to_dict(),
+            "active_main_selection_path": str(main_selection_path),
+            "active_br_selection_path": str(br_selection_path),
+            "active_main_expected_payoff_vs_meta": float(selected_main_candidate.expected_payoff_vs_meta),
+            "active_br_expected_payoff_vs_meta": float(selected_br_candidate.expected_payoff_vs_meta),
+            "promoted_policy_ids": [entry.policy_id for entry in promoted_entries],
+            "baseline_eval_only": True,
+            "draw_rate": float(self_play_analysis.draw_rate),
+            "late_round_rate": float(self_play_analysis.late_round_rate),
+        }
+        atomic_write_json(analysis_path, analysis_payload)
+        current_training_checkpoint = Path(selected_main_checkpoint)
+        atomic_write_json(
+            state_path,
+            {
+                "working_checkpoint": str(current_training_checkpoint),
+                "round": round_index,
+                "p2sro_state_path": str(p2sro_state_path),
+                "meta_strategy_path": str(deployment_manifest_path),
+            },
+        )
+        round_result = PpoManagedRoundResult(
+            round_index=round_index,
+            bootstrap_path=(str(bootstrap_path) if bootstrap_path.exists() else None),
+            self_play_path=str(self_play_path),
+            train_artifacts=main_train_artifacts,
+            analysis_path=str(analysis_path),
+            working_checkpoint=str(current_training_checkpoint),
+            deployment_checkpoint=str(deployment_manifest_path),
+        )
+        round_results = [item for item in round_results if item.round_index != round_index]
+        round_results.append(round_result)
+        round_results.sort(key=lambda item: item.round_index)
+        append_history(
+            history_path,
+            {
+                "event_type": "round_completed",
+                "round": round_index,
+                "algorithm": "p2sro",
+                "working_checkpoint": str(current_training_checkpoint),
+                "deployment_checkpoint": str(deployment_manifest_path),
+                "active_main_expected_payoff_vs_meta": float(selected_main_candidate.expected_payoff_vs_meta),
+                "active_br_expected_payoff_vs_meta": float(selected_br_candidate.expected_payoff_vs_meta),
+                "frozen_population_members": [entry.policy_id for entry in manager.frozen_entries()],
+                "meta_probabilities": dict(meta_snapshot.probabilities),
+                "active_main_slot_lineage": main_slot_state.lineage,
+                "active_br_slot_lineage": br_slot_state.lineage,
+                "promoted_policy_ids": [entry.policy_id for entry in promoted_entries],
+                "draw_rate": float(self_play_analysis.draw_rate),
+                "late_round_rate": float(self_play_analysis.late_round_rate),
+            },
+        )
+        cleanup_completed_round_training_temps(workspace_path, completed_round=round_index - 1)
+        pruned_rounds = prune_old_round_directories(
+            workspace_path,
+            current_round=round_index,
+            retain_round_directories=retain_round_directories,
+            protected_paths=(
+                current_training_checkpoint,
+            ),
+        )
+        if pruned_rounds:
+            round_results = [
+                item for item in round_results
+                if f"round_{item.round_index:04d}" not in pruned_rounds
+            ]
+
+    if current_training_checkpoint is None:
+        raise RuntimeError("P2SRO loop finished without a checkpoint")
+    if inference_server is not None:
+        inference_server.close()
+    payload = {
+        "workspace": str(workspace_path),
+        "working_checkpoint": str(current_training_checkpoint),
+        "deployment_checkpoint": str(deployment_manifest_path),
+        "status_path": str(status_path),
+        "history_path": str(history_path),
+        "state_path": str(state_path),
+        "p2sro_state_path": str(p2sro_state_path),
+        "rounds": [
+            {
+                "round": item.round_index,
+                "bootstrap_path": item.bootstrap_path,
+                "self_play_path": item.self_play_path,
+                "training_checkpoint": item.train_artifacts.training_checkpoint,
+                "deployment_checkpoint": item.deployment_checkpoint,
+                "working_checkpoint": item.working_checkpoint,
+                "analysis_path": item.analysis_path,
+            }
+            for item in round_results
+        ],
+    }
+    atomic_write_json(result_path, payload)
+    return PpoManagedLoopArtifacts(
+        workspace=str(workspace_path),
+        rounds=tuple(round_results),
+        working_checkpoint=str(current_training_checkpoint),
+        deployment_checkpoint=str(deployment_manifest_path),
+        status_path=str(status_path),
+        history_path=str(history_path),
+        state_path=str(state_path),
+    )

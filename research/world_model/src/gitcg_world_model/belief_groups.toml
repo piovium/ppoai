@@ -1,0 +1,47 @@
+# Human-reviewable belief grouping priors.
+# These groups are hand-authored semantic buckets, not simulator-native truth.
+# If the group names or card-to-group assignments are disputed, edit this file
+# instead of changing model code.
+
+groups = [
+  "burst_finisher",
+  "direct_damage",
+  "heal_or_revive",
+  "shield_or_damage_mitigation",
+  "dice_fix_or_ramp",
+  "draw_or_search",
+  "tempo_switch",
+  "equipment_weapon_or_artifact",
+  "support_engine",
+  "summon_or_board_pressure",
+]
+
+[card_groups]
+214111 = ["equipment_weapon_or_artifact", "burst_finisher"]
+215101 = ["equipment_weapon_or_artifact", "direct_damage"]
+216091 = ["equipment_weapon_or_artifact", "direct_damage"]
+222031 = ["equipment_weapon_or_artifact", "shield_or_damage_mitigation"]
+311503 = ["equipment_weapon_or_artifact", "dice_fix_or_ramp"]
+312004 = ["equipment_weapon_or_artifact", "direct_damage"]
+312021 = ["equipment_weapon_or_artifact", "shield_or_damage_mitigation"]
+312025 = ["equipment_weapon_or_artifact", "burst_finisher"]
+312029 = ["equipment_weapon_or_artifact", "support_engine"]
+321002 = ["support_engine", "draw_or_search"]
+321011 = ["support_engine", "dice_fix_or_ramp"]
+321016 = ["support_engine", "summon_or_board_pressure"]
+322002 = ["heal_or_revive", "shield_or_damage_mitigation"]
+322009 = ["heal_or_revive", "draw_or_search"]
+322025 = ["heal_or_revive", "dice_fix_or_ramp"]
+323004 = ["shield_or_damage_mitigation", "heal_or_revive"]
+330005 = ["tempo_switch", "direct_damage"]
+330008 = ["tempo_switch", "dice_fix_or_ramp"]
+331601 = ["shield_or_damage_mitigation", "support_engine"]
+332002 = ["draw_or_search"]
+332003 = ["dice_fix_or_ramp", "draw_or_search"]
+332004 = ["tempo_switch"]
+332005 = ["direct_damage"]
+332006 = ["shield_or_damage_mitigation"]
+332018 = ["summon_or_board_pressure", "tempo_switch"]
+332025 = ["burst_finisher", "direct_damage"]
+333003 = ["summon_or_board_pressure", "support_engine"]
+333004 = ["summon_or_board_pressure", "support_engine"]

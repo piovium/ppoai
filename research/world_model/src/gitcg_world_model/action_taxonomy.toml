@@ -1,0 +1,96 @@
+# Human-reviewable hierarchical action taxonomy.
+# Only `active_taxonomy` is consumed at runtime. The other taxonomy blocks are
+# kept here so category names/boundaries can be reviewed and revised later
+# without changing the main code structure.
+
+active_taxonomy = "mixed_v1"
+
+[intent_v1.ACTION]
+categories = [
+  "skill_commit",
+  "skill_setup",
+  "card_resource",
+  "card_draw_search",
+  "card_buff_equip",
+  "card_board_setup",
+  "card_defense_heal",
+  "switch_tempo",
+  "tune_fix",
+  "declare_end",
+]
+
+[intent_v1.REROLL_DICE]
+categories = [
+  "keep_all",
+  "reroll_minor",
+  "reroll_major",
+  "reroll_all",
+]
+
+[intent_v1.CHOOSE_ACTIVE]
+categories = [
+  "choose_mainline",
+  "choose_safety",
+  "choose_setup",
+]
+
+[intent_v1.SELECT_CARD]
+categories = [
+  "keep_core",
+  "keep_curve",
+  "keep_resource",
+  "keep_flex",
+]
+
+[intent_v1.SWITCH_HANDS]
+categories = [
+  "switch_none",
+  "switch_minor",
+  "switch_major",
+  "switch_all",
+]
+
+[mixed_v1.ACTION]
+categories = [
+  "skill_commit",
+  "skill_setup",
+  "card_resource",
+  "card_draw_search",
+  "card_buff_equip",
+  "card_board_setup",
+  "card_defense_heal",
+  "switch_tempo",
+  "tune_fix",
+  "declare_end",
+]
+
+[mixed_v1.REROLL_DICE]
+categories = [
+  "keep_all",
+  "reroll_minor",
+  "reroll_major",
+  "reroll_all",
+]
+
+[mixed_v1.CHOOSE_ACTIVE]
+categories = [
+  "choose_mainline",
+  "choose_safety",
+  "choose_setup",
+]
+
+[mixed_v1.SELECT_CARD]
+categories = [
+  "keep_core",
+  "keep_curve",
+  "keep_resource",
+  "keep_flex",
+]
+
+[mixed_v1.SWITCH_HANDS]
+categories = [
+  "switch_none",
+  "switch_minor",
+  "switch_major",
+  "switch_all",
+]
