@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
+from threading import RLock
 from typing import Any
 
-from .action_hierarchy import build_action_legality_engine
+from .action_hierarchy import (
+    build_action_legality_engine,
+    classify_action_outcome_key,
+    high_level_code_for_key,
+    rebuild_encoded_action_set,
+)
 from .schema import (
+    ActionChoice,
     DecisionContext,
     DecisionType,
+    EnvConfig,
     LowLevelActionSpec,
+    Matchup,
     OptionKind,
     PublicSlotTarget,
     StateSnapshot,
@@ -22,6 +32,14 @@ REQ_VOID = 0
 REQ_ALIGNED = 8
 REQ_ENERGY = 9
 REQ_LEGEND = 10
+_RESULT_RELABEL_CACHE_LIMIT = 2048
+_RESULT_RELABEL_CACHE_LOCK = RLock()
+_RESULT_RELABEL_CACHE: dict[tuple[Any, ...], dict[int, int]] = {}
+_DIRECT_ACTION_LABEL_KINDS = {
+    OptionKind.ACTION_DECLARE_END,
+    OptionKind.ACTION_SWITCH_ACTIVE,
+    OptionKind.ACTION_ELEMENTAL_TUNING,
+}
 
 
 @dataclass(frozen=True)
@@ -54,6 +72,7 @@ def build_decision_context(
     full_state_json: str | None,
     step_index: int,
     metadata: dict[str, Any] | None = None,
+    enable_result_based_action_relabel: bool = True,
 ) -> BuiltDecisionContext:
     metadata = metadata or {}
     builder = {
@@ -75,6 +94,22 @@ def build_decision_context(
         visible_state=player_view or full_state,
         legal_specs=tuple(item.spec for item in spec_payloads),
     )
+    if (
+        enable_result_based_action_relabel
+        and request_type == DecisionType.ACTION
+        and full_state_json
+        and encoded_actions.legal_low_level_codes
+    ):
+        encoded_actions, low_to_high_code = _relabel_action_high_levels_by_result(
+            acting_player=acting_player,
+            full_state_json=full_state_json,
+            full_state=full_state,
+            legal_low_level_codes=encoded_actions.legal_low_level_codes,
+            legal_low_level_mask=encoded_actions.legal_low_level_mask,
+            low_to_high_code=low_to_high_code,
+            legality_engine=legality_engine,
+            metadata=metadata,
+        )
     payload_by_low_level_code = {
         int(spec.action_code): dict(item.payload)
         for spec, item in zip(materialized_specs, spec_payloads, strict=False)
@@ -102,6 +137,131 @@ def build_decision_context(
         payload_by_low_level_code=payload_by_low_level_code,
         label_by_low_level_code=label_by_low_level_code,
         low_to_high_code=low_to_high_code,
+    )
+
+
+def _relabel_action_high_levels_by_result(
+    *,
+    acting_player: int,
+    full_state_json: str,
+    full_state: StateSnapshot,
+    legal_low_level_codes: tuple[int, ...],
+    legal_low_level_mask: tuple[bool, ...],
+    low_to_high_code: dict[int, int],
+    legality_engine,
+    metadata: dict[str, Any] | None,
+) -> tuple[Any, dict[int, int]]:
+    from .env import GitcgDecisionEnv
+
+    metadata = metadata or {}
+    matchup = _matchup_from_metadata(metadata)
+    cache_key = _result_relabel_cache_key(
+        acting_player=acting_player,
+        full_state_json=full_state_json,
+        legal_low_level_codes=legal_low_level_codes,
+    )
+    with _RESULT_RELABEL_CACHE_LOCK:
+        cached = _RESULT_RELABEL_CACHE.get(cache_key)
+    if cached is not None:
+        return rebuild_encoded_action_set(
+            legal_low_level_codes=legal_low_level_codes,
+            legal_low_level_mask=legal_low_level_mask,
+            low_to_high_code=cached,
+        ), dict(cached)
+    env = GitcgDecisionEnv(
+        _result_relabel_env_config(),
+        matchup,
+        enable_result_based_action_relabel=False,
+    )
+    codebook = legality_engine.codebook
+    relabeled: dict[int, int] = {}
+    try:
+        for action_code in legal_low_level_codes:
+            spec = codebook.low_spec(int(action_code))
+            # These kinds still have real downstream game consequences, but under the
+            # current ACTION taxonomy their primary high-level label is defined by the
+            # action type itself:
+            # - declare_end -> yield_initiative
+            # - switch_active -> switch_character
+            # - elemental_tuning -> elemental_tuning
+            # We therefore skip the one-step relabel simulation here because the
+            # simulated post-state would not change the chosen high-level bucket.
+            if spec.kind in _DIRECT_ACTION_LABEL_KINDS:
+                key = classify_action_outcome_key(
+                    spec=spec,
+                    pre_state=full_state,
+                    post_state=full_state,
+                    acting_player=acting_player,
+                )
+                relabeled[int(action_code)] = high_level_code_for_key(
+                    codebook,
+                    DecisionType.ACTION,
+                    key,
+                )
+                continue
+            env.reset(state_json=full_state_json)
+            _, step, _ = env.step(ActionChoice(action_code=int(action_code)))
+            key = classify_action_outcome_key(
+                spec=spec,
+                pre_state=full_state,
+                post_state=step.post_state,
+                acting_player=acting_player,
+            )
+            relabeled[int(action_code)] = high_level_code_for_key(
+                codebook,
+                DecisionType.ACTION,
+                key,
+            )
+    except Exception:
+        return rebuild_encoded_action_set(
+            legal_low_level_codes=legal_low_level_codes,
+            legal_low_level_mask=legal_low_level_mask,
+            low_to_high_code=low_to_high_code,
+        ), low_to_high_code
+    finally:
+        env.close()
+    with _RESULT_RELABEL_CACHE_LOCK:
+        if len(_RESULT_RELABEL_CACHE) >= _RESULT_RELABEL_CACHE_LIMIT:
+            oldest_key = next(iter(_RESULT_RELABEL_CACHE))
+            _RESULT_RELABEL_CACHE.pop(oldest_key, None)
+        _RESULT_RELABEL_CACHE[cache_key] = dict(relabeled)
+    return rebuild_encoded_action_set(
+        legal_low_level_codes=legal_low_level_codes,
+        legal_low_level_mask=legal_low_level_mask,
+        low_to_high_code=relabeled,
+    ), relabeled
+
+
+def _matchup_from_metadata(metadata: dict[str, Any]) -> Matchup:
+    matchup_key = str(metadata.get("matchup", "unknown__vs__unknown"))
+    if "__vs__" not in matchup_key:
+        return Matchup("unknown", "unknown")
+    deck0, deck1 = matchup_key.split("__vs__", maxsplit=1)
+    if not deck0 or not deck1:
+        return Matchup("unknown", "unknown")
+    return Matchup(deck0, deck1)
+
+
+def _result_relabel_env_config() -> EnvConfig:
+    return EnvConfig(
+        deck_pool=(),
+        record_full_state_json=False,
+        record_player_view=True,
+        draw_penalty=0.0,
+    )
+
+
+def _result_relabel_cache_key(
+    *,
+    acting_player: int,
+    full_state_json: str,
+    legal_low_level_codes: tuple[int, ...],
+) -> tuple[Any, ...]:
+    digest = hashlib.blake2b(full_state_json.encode("utf-8"), digest_size=16).hexdigest()
+    return (
+        int(acting_player),
+        digest,
+        tuple(int(code) for code in legal_low_level_codes),
     )
 
 

@@ -1,0 +1,88 @@
+# Auxiliary intent supervision draft.
+# This file is NOT active in runtime decision-making.
+# It exists so humans or other agents can review/edit higher-level fuzzy intents
+# separately from the active mechanistic high-level action taxonomy.
+#
+# Intended use:
+# - optional auxiliary supervision
+# - optional analysis
+# - optional future search-prior shaping
+# - NOT direct action execution
+
+active_intent_scheme = "draft_v1"
+
+[draft_v1]
+enabled = false
+notes = [
+  "These intent labels are auxiliary-only and should not replace the active executable action hierarchy.",
+  "Soft labels are preferred over single hard labels.",
+  "Recommended supervision sources: SePoT deltas, teacher search deltas, critic deltas, or hand-authored review labels.",
+]
+
+[draft_v1.ACTION]
+labels = [
+  "survive",
+  "lethal",
+  "board_setup",
+  "resource_fix",
+  "draw_search",
+  "tempo_switch",
+  "energy_setup",
+  "reaction_setup",
+]
+
+[draft_v1.ACTION.label_descriptions]
+survive = "Action mainly improves near-term survival or reduces immediate death risk."
+lethal = "Action mainly improves current or next-step kill / finish line pressure."
+board_setup = "Action mainly improves future board presence such as supports, summons, or durable buffs."
+resource_fix = "Action mainly improves dice usability, payment flexibility, or future playable coverage."
+draw_search = "Action mainly improves access to future options by drawing, searching, or filtering."
+tempo_switch = "Action mainly changes initiative, active-slot pressure, or turn-order leverage."
+energy_setup = "Action mainly improves burst readiness or energy progression."
+reaction_setup = "Action mainly improves elemental attachment or future reaction opportunity."
+
+[draft_v1.ACTION.supervision]
+mode = "soft_multilabel"
+primary_sources = [
+  "sepot_rollout_delta",
+  "teacher_search_delta",
+  "critic_delta",
+]
+manual_override_allowed = true
+
+[draft_v1.ACTION.soft_target_examples]
+survive = "delta in self survival value"
+lethal = "delta in opponent lethal probability or kill-line score"
+resource_fix = "delta in future legal high-value action coverage"
+board_setup = "delta in durable future board assets"
+
+[draft_v1.CHOOSE_ACTIVE]
+labels = [
+  "mainline_entry",
+  "survival_switch",
+  "burst_setup",
+]
+
+[draft_v1.REROLL_DICE]
+labels = [
+  "keep_curve",
+  "minor_fix",
+  "major_fix",
+  "hard_chase",
+]
+
+[draft_v1.SELECT_CARD]
+labels = [
+  "keep_core_piece",
+  "keep_curve_piece",
+  "keep_resource_piece",
+  "keep_flex_piece",
+]
+
+[draft_v1.SWITCH_HANDS]
+labels = [
+  "partial_refresh",
+  "resource_refresh",
+  "function_refresh",
+  "full_refresh",
+]

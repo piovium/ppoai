@@ -524,6 +524,13 @@ def _summarize_round(round_number: int, steps: list[dict[str, Any]]) -> list[str
 def render_episode(path: Path, output_path: Path) -> None:
     payload = _load_json(path)
     steps = list(payload.get("steps", []))
+    for index, step in enumerate(steps):
+        if step.get("full_state_json_after"):
+            continue
+        if index + 1 < len(steps):
+            step["full_state_json_after"] = steps[index + 1].get("full_state_json_before")
+        else:
+            step["full_state_json_after"] = payload.get("final_state_json")
     grouped: dict[int, list[dict[str, Any]]] = {}
     for step in steps:
         round_number = int(step.get("pre_state", {}).get("round_number", -1))

@@ -101,10 +101,18 @@ class _CrashEvent:
 
 
 class GitcgDecisionEnv:
-    def __init__(self, config: EnvConfig, matchup: Matchup, *, initial_state_json: str | None = None):
+    def __init__(
+        self,
+        config: EnvConfig,
+        matchup: Matchup,
+        *,
+        initial_state_json: str | None = None,
+        enable_result_based_action_relabel: bool = True,
+    ):
         self._config = config
         self._matchup = matchup
         self._initial_state_json = initial_state_json
+        self._enable_result_based_action_relabel = bool(enable_result_based_action_relabel)
         self._event_queue: Queue[Any] = Queue()
         self._response_queue: Queue[Any] = Queue()
         self._worker: Thread | None = None
@@ -189,11 +197,9 @@ class GitcgDecisionEnv:
             ),
             player_view=self._current_context.player_view,
             full_state_json_before=self._current_context.full_state_json,
-            full_state_json_after=terminal_context.full_state_json,
             metadata={
                 "matchup": self._matchup.key,
                 "action_label": _action_label(self._current_built_context, chosen_action_code),
-                "chosen_action_code": chosen_action_code,
                 **terminal_context.metadata,
             },
         )
@@ -345,6 +351,7 @@ class GitcgDecisionEnv:
                             "matchup": env._matchup.key,
                             "seed": env._seed,
                         },
+                        enable_result_based_action_relabel=env._enable_result_based_action_relabel,
                     )
                     context = built_context.context
                     step_index_ref["value"] += 1

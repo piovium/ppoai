@@ -176,7 +176,6 @@ def _deserialize_trajectory_step(payload: dict[str, Any]) -> TrajectoryStep:
             else None
         ),
         full_state_json_before=payload.get("full_state_json_before"),
-        full_state_json_after=payload.get("full_state_json_after"),
         metadata=dict(payload.get("metadata", {})),
     )
 

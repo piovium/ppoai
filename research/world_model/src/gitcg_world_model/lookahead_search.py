@@ -206,7 +206,11 @@ def _evaluate_root_option(
     depth: int,
     seed: int | None,
 ) -> float:
-    env = GitcgDecisionEnv(_teacher_env_config(env_config), matchup)
+    env = GitcgDecisionEnv(
+        _teacher_env_config(env_config),
+        matchup,
+        enable_result_based_action_relabel=False,
+    )
     try:
         context = env.reset(seed=seed, state_json=step.full_state_json_before)
         option_index = match_low_level_code_index(context, action_code)
@@ -316,7 +320,11 @@ def _rebuild_root_context(
 ) -> DecisionContext | None:
     if not state_json:
         return None
-    env = GitcgDecisionEnv(_teacher_env_config(env_config), matchup)
+    env = GitcgDecisionEnv(
+        _teacher_env_config(env_config),
+        matchup,
+        enable_result_based_action_relabel=False,
+    )
     try:
         return env.reset(seed=seed, state_json=state_json)
     except Exception:

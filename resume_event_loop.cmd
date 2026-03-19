@@ -59,9 +59,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "    '--target-kl-high', '0.05'," ^
   "    '--use-amp'," ^
   "    '--device', 'cuda'," ^
-  "    '--workers', '4'," ^
-  "    '--inference-max-batch-size', '128'," ^
-  "    '--inference-max-wait-ms', '2'," ^
+  "    '--workers', '12'," ^
+  "    '--inference-max-batch-size', '192'," ^
+  "    '--inference-max-wait-ms', '4'," ^
   "    '--retain-round-directories', '6'," ^
   "    '--resume'," ^
   "    '--status-print'" ^

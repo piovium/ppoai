@@ -110,8 +110,6 @@ class PpoAgent:
             "selected_logprob": executed_logprob,
             "partial_value": float(evaluation["partial_value"]),
             "policy_entropy": float(evaluation["policy_entropy"]),
-            "chosen_action_code": selected_action_code,
-            "chosen_high_action_code": int(encoded.low_to_high_codes[action_index]),
             "chosen_action_index": action_index,
             "policy_action_index": int(action_index),
             "sampled_policy_action_index": int(action_index),

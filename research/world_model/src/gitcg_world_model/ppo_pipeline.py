@@ -47,6 +47,7 @@ from .managed_loop_utils import (
     auto_device,
     cleanup_completed_round_training_temps,
     prune_old_round_directories,
+    print_episode_progress,
     write_episode_analysis,
     write_runtime_manifest,
 )
@@ -116,9 +117,9 @@ def _recommended_rollout_workers(requested_workers: int, checkpoint_path: Path |
         config_payload.get("recurrent_hidden_dim", _default_model_config_value("recurrent_hidden_dim"))
     )
     if d_model >= 512 or num_layers >= 8 or recurrent_hidden_dim >= 512:
-        return max(1, min(requested_workers, 4))
+        return max(1, min(requested_workers, 8))
     if d_model >= 384 or num_layers >= 6 or recurrent_hidden_dim >= 384:
-        return max(1, min(requested_workers, 6))
+        return max(1, min(requested_workers, 8))
     return max(1, requested_workers)
 
 
@@ -447,16 +448,28 @@ def _execute_episode_jobs(
     completed: list[_EpisodeJobResult] = []
     total = len(jobs)
     effective_workers = max(1, workers)
+    pending_episodes: list[EpisodeRecord] = []
+    flush_threshold = 8
+
+    def flush_pending() -> None:
+        nonlocal pending_episodes
+        if destination is None or not pending_episodes:
+            pending_episodes = []
+            return
+        append_episode_records(destination, pending_episodes)
+        pending_episodes = []
+
     if effective_workers <= 1:
         for index, job in enumerate(jobs, start=1):
             result = _run_episode_job(config=config, max_decisions=max_decisions, job=job)
             completed.append(result)
-            if destination is not None:
-                append_episode_records(destination, [result.episode])
+            pending_episodes.append(result.episode)
+            if len(pending_episodes) >= flush_threshold:
+                flush_pending()
             if progress_callback is not None:
                 progress_callback(index, total, result)
     else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = [
                 executor.submit(
                     _run_episode_job,
@@ -471,10 +484,12 @@ def _execute_episode_jobs(
                 result = future.result()
                 completed.append(result)
                 done += 1
-                if destination is not None:
-                    append_episode_records(destination, [result.episode])
+                pending_episodes.append(result.episode)
+                if len(pending_episodes) >= flush_threshold:
+                    flush_pending()
                 if progress_callback is not None:
                     progress_callback(done, total, result)
+    flush_pending()
     completed.sort(key=lambda item: item.job.job_index)
     return tuple(item.episode for item in completed)
 
@@ -915,6 +930,7 @@ def _evaluate_checkpoint_against_population(
     inference_server: GpuInferenceServer | None,
     episodes_per_matchup: int,
     seed_start: int,
+    progress_callback: Callable[[int, int, EpisodeRecord, str], None] | None = None,
 ) -> tuple[float, dict[str, float], tuple[dict[str, object], ...]]:
     per_policy_payoffs: dict[str, float] = {}
     matchup_payloads: list[dict[str, object]] = []
@@ -974,6 +990,11 @@ def _evaluate_checkpoint_against_population(
             jobs=jobs,
             max_decisions=max_decisions,
             workers=workers,
+            progress_callback=(
+                (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                    progress_callback(done, total, result.episode, opponent_policy_id))
+                if progress_callback is not None else None
+            ),
         )
         wins = sum(1 for episode in episodes if episode.winner == 0)
         losses = sum(1 for episode in episodes if episode.winner == 1)
@@ -1025,6 +1046,7 @@ def _select_active_slot_checkpoint(
     workers: int,
     inference_server: GpuInferenceServer | None,
     enable_status_print: bool,
+    round_index: int | None = None,
 ) -> tuple[Path, int, Path, _SlotCandidateEvaluation]:
     summary_payload = _load_training_summary_payload(train_artifacts.summary_path)
     shortlist_epochs, safe_epochs, fallback_reason = _shortlist_candidate_epochs(
@@ -1053,6 +1075,18 @@ def _select_active_slot_checkpoint(
             inference_server=inference_server,
             episodes_per_matchup=benchmark_config.episodes_per_matchup,
             seed_start=seed_start + epoch * 1_000,
+            progress_callback=(
+                (lambda done, total, episode, opponent_policy_id, eval_epoch=epoch:
+                    print_episode_progress(
+                        label=f"p2sro-selection-e{eval_epoch:03d}",
+                        round_index=round_index or 0,
+                        completed=done,
+                        total=total,
+                        episode=episode,
+                        extra=f"frozen:{opponent_policy_id}",
+                    ))
+                if enable_status_print else None
+            ),
         )
         candidate = _SlotCandidateEvaluation(
             epoch=epoch,
@@ -1116,6 +1150,8 @@ def _update_p2sro_payoff_matrix(
     inference_server: GpuInferenceServer | None,
     episodes_per_matchup: int,
     seed_start: int,
+    round_index: int | None = None,
+    enable_status_print: bool = False,
 ) -> dict[str, float]:
     cache: dict[tuple[str, str], tuple[Any, Any]] = {}
     per_policy_payoffs: dict[str, float] = {}
@@ -1175,6 +1211,18 @@ def _update_p2sro_payoff_matrix(
             jobs=jobs,
             max_decisions=max_decisions,
             workers=workers,
+            progress_callback=(
+                (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                    print_episode_progress(
+                        label=f"p2sro-payoff-{candidate_policy_id}",
+                        round_index=round_index or 0,
+                        completed=done,
+                        total=total,
+                        episode=result.episode,
+                        extra=f"frozen:{opponent_policy_id}",
+                    ))
+                if enable_status_print else None
+            ),
         )
         wins = sum(1 for episode in episodes if episode.winner == 0)
         losses = sum(1 for episode in episodes if episode.winner == 1)
@@ -1309,10 +1357,121 @@ def run_ppo_managed_loop(
     tracker = ProgressTracker(
         status_path=status_path,
         event_log_path=history_path,
-        overall_total_units=max(1, rounds * 4),
+        overall_total_units=max(1, rounds * 5),
         worker_count=max(1, workers),
         enable_print=enable_status_print,
     )
+
+    def _episode_phase_callback(
+        *,
+        phase: str,
+        round_index: int,
+        phase_total_units: int,
+        phase_overall_units: int,
+        artifacts: dict[str, str],
+        label: str,
+    ) -> Callable[[int, int, EpisodeRecord], None]:
+        def callback(done: int, total: int, episode: EpisodeRecord) -> None:
+            tracker.update_phase(
+                phase,
+                completed_units=done,
+                total_units=phase_total_units,
+                current_task=f"round_{round_index:04d} {done}/{total} {episode.matchup}",
+                overall_completed_units=phase_overall_units,
+                artifacts=artifacts,
+                details={
+                    "last_matchup": episode.matchup,
+                    "last_winner": episode.winner,
+                    "last_steps": len(episode.steps),
+                    "last_truncated": bool(episode.metadata.get("truncated")),
+                },
+            )
+            if enable_status_print:
+                print_episode_progress(
+                    label=label,
+                    round_index=round_index,
+                    completed=done,
+                    total=total,
+                    episode=episode,
+                )
+
+        return callback
+
+    def _self_play_phase_callback(
+        *,
+        phase: str,
+        round_index: int,
+        phase_total_units: int,
+        phase_overall_units: int,
+        artifacts: dict[str, str],
+        label: str,
+    ) -> SelfPlayProgressCallback:
+        def callback(done: int, total: int, episode: EpisodeRecord, opponent_label: str) -> None:
+            tracker.update_phase(
+                phase,
+                completed_units=done,
+                total_units=phase_total_units,
+                current_task=f"round_{round_index:04d} {done}/{total} {episode.matchup}",
+                overall_completed_units=phase_overall_units,
+                artifacts=artifacts,
+                details={
+                    "last_matchup": episode.matchup,
+                    "last_winner": episode.winner,
+                    "last_steps": len(episode.steps),
+                    "last_truncated": bool(episode.metadata.get("truncated")),
+                    "last_opponent": opponent_label,
+                },
+            )
+            if enable_status_print:
+                print_episode_progress(
+                    label=label,
+                    round_index=round_index,
+                    completed=done,
+                    total=total,
+                    episode=episode,
+                    extra=opponent_label,
+                )
+
+        return callback
+
+    def _training_phase_callback(
+        *,
+        phase: str,
+        round_index: int,
+        episode_units: int,
+        phase_total_units: int,
+        phase_overall_units: int,
+        artifacts: dict[str, str],
+        label: str,
+    ) -> Callable[[int, int, PpoTrainingMetrics, bool], None]:
+        def callback(epoch_index: int, epoch_total: int, metrics: PpoTrainingMetrics, is_best: bool) -> None:
+            tracker.update_phase(
+                phase,
+                completed_units=episode_units + epoch_index,
+                total_units=phase_total_units,
+                current_task=f"round_{round_index:04d} epoch={epoch_index}/{epoch_total}",
+                overall_completed_units=phase_overall_units,
+                artifacts=artifacts,
+                details={
+                    "epoch": epoch_index,
+                    "epochs": epoch_total,
+                    "total_loss": metrics.total_loss,
+                    "approx_kl": metrics.approx_kl,
+                    "best": is_best,
+                },
+            )
+            if enable_status_print:
+                print(
+                    f"[{label}] "
+                    f"round={round_index:04d} "
+                    f"epoch={epoch_index}/{epoch_total} "
+                    f"loss={metrics.total_loss:.4f} "
+                    f"kl={metrics.approx_kl:.4f} "
+                    f"best={is_best}",
+                    flush=True,
+                )
+
+        return callback
     state = _load_loop_state(state_path) if resume else _LoopState(
         working_checkpoint=None,
         completed_round=0,
@@ -1358,12 +1517,14 @@ def run_ppo_managed_loop(
         round_base_checkpoint = current_training_checkpoint
         if round_base_checkpoint is None:
             total_bootstrap = len(matchups) * bootstrap_episodes_per_matchup
+            bootstrap_phase_total = total_bootstrap + bootstrap_epochs
+            bootstrap_phase_artifacts = {"bootstrap_path": str(bootstrap_path)}
             tracker.start_phase(
                 "bootstrap",
-                total_units=total_bootstrap,
+                total_units=bootstrap_phase_total,
                 current_task=f"round_{round_index:04d}",
                 overall_completed_units=(round_index - 1) * 5,
-                artifacts={"bootstrap_path": str(bootstrap_path)},
+                artifacts=bootstrap_phase_artifacts,
             )
             bootstrap_episodes = collect_bootstrap_episodes(
                 config=env_config,
@@ -1373,6 +1534,14 @@ def run_ppo_managed_loop(
                 max_decisions=max_decisions,
                 output_path=bootstrap_path,
                 workers=resolved_workers,
+                progress_callback=_episode_phase_callback(
+                    phase="bootstrap",
+                    round_index=round_index,
+                    phase_total_units=bootstrap_phase_total,
+                    phase_overall_units=(round_index - 1) * 5,
+                    artifacts=bootstrap_phase_artifacts,
+                    label="bootstrap",
+                ),
             )
             bootstrap_analysis = analyze_episode_records(bootstrap_episodes, player=0)
             write_episode_analysis(
@@ -1393,12 +1562,23 @@ def run_ppo_managed_loop(
                 weight_decay=weight_decay,
                 grad_clip_norm=grad_clip_norm,
                 use_amp=use_amp,
-                progress_callback=None,
+                progress_callback=_training_phase_callback(
+                    phase="bootstrap",
+                    round_index=round_index,
+                    episode_units=total_bootstrap,
+                    phase_total_units=bootstrap_phase_total,
+                    phase_overall_units=(round_index - 1) * 5,
+                    artifacts={
+                        **bootstrap_phase_artifacts,
+                        "bootstrap_train_dir": str(bootstrap_train_dir),
+                    },
+                    label="bootstrap-train",
+                ),
             )
             round_base_checkpoint = Path(bootstrap_artifacts.deployment_checkpoint)
             tracker.complete_phase(
                 "bootstrap",
-                total_units=total_bootstrap,
+                total_units=bootstrap_phase_total,
                 current_task=f"round_{round_index:04d}",
                 overall_completed_units=(round_index - 1) * 5 + 1,
                 artifacts={
@@ -1436,6 +1616,8 @@ def run_ppo_managed_loop(
             overall_completed_units=(round_index - 1) * 5 + 1,
             artifacts={"self_play_path": str(self_play_path), "train_dir": str(train_dir)},
         )
+        main_phase_total = (len(matchups) * self_play_episodes_per_matchup) + epochs
+        main_phase_artifacts = {"self_play_path": str(self_play_path), "train_dir": str(train_dir)}
         self_play_episodes = collect_p2sro_training_episodes(
             config=env_config,
             current_checkpoint=main_seed_checkpoint,
@@ -1449,6 +1631,14 @@ def run_ppo_managed_loop(
             output_path=self_play_path,
             workers=resolved_workers,
             inference_server=inference_server,
+            progress_callback=_self_play_phase_callback(
+                phase="active_main_slot",
+                round_index=round_index,
+                phase_total_units=main_phase_total,
+                phase_overall_units=(round_index - 1) * 5 + 1,
+                artifacts=main_phase_artifacts,
+                label="active-main-episode",
+            ),
         )
         self_play_analysis = analyze_episode_records(self_play_episodes, player=0)
         write_episode_analysis(
@@ -1486,7 +1676,15 @@ def run_ppo_managed_loop(
             target_kl_low=target_kl_low,
             target_kl_high=target_kl_high,
             use_amp=use_amp,
-            progress_callback=None,
+            progress_callback=_training_phase_callback(
+                phase="active_main_slot",
+                round_index=round_index,
+                episode_units=len(matchups) * self_play_episodes_per_matchup,
+                phase_total_units=main_phase_total,
+                phase_overall_units=(round_index - 1) * 5 + 1,
+                artifacts=main_phase_artifacts,
+                label="active-main-train",
+            ),
         )
         selected_main_checkpoint, selected_main_epoch, main_selection_path, selected_main_candidate = _select_active_slot_checkpoint(
             train_dir=train_dir,
@@ -1502,6 +1700,7 @@ def run_ppo_managed_loop(
             workers=resolved_workers,
             inference_server=inference_server,
             enable_status_print=enable_status_print,
+            round_index=round_index,
         )
         main_slot_state = manager.update_active_slot_result(
             slot_name="active_main_slot",
@@ -1539,6 +1738,8 @@ def run_ppo_managed_loop(
             overall_completed_units=(round_index - 1) * 5 + 2,
             artifacts={"self_play_path": str(br_self_play_path), "train_dir": str(br_train_dir)},
         )
+        br_phase_total = (len(matchups) * self_play_episodes_per_matchup) + epochs
+        br_phase_artifacts = {"self_play_path": str(br_self_play_path), "train_dir": str(br_train_dir)}
         br_self_play_episodes = collect_p2sro_training_episodes(
             config=env_config,
             current_checkpoint=selected_main_checkpoint,
@@ -1552,6 +1753,14 @@ def run_ppo_managed_loop(
             output_path=br_self_play_path,
             workers=resolved_workers,
             inference_server=inference_server,
+            progress_callback=_self_play_phase_callback(
+                phase="active_br_slot",
+                round_index=round_index,
+                phase_total_units=br_phase_total,
+                phase_overall_units=(round_index - 1) * 5 + 2,
+                artifacts=br_phase_artifacts,
+                label="active-br-episode",
+            ),
         )
         br_self_play_analysis = analyze_episode_records(br_self_play_episodes, player=0)
         write_episode_analysis(
@@ -1585,7 +1794,15 @@ def run_ppo_managed_loop(
             target_kl_low=target_kl_low,
             target_kl_high=target_kl_high,
             use_amp=use_amp,
-            progress_callback=None,
+            progress_callback=_training_phase_callback(
+                phase="active_br_slot",
+                round_index=round_index,
+                episode_units=len(matchups) * self_play_episodes_per_matchup,
+                phase_total_units=br_phase_total,
+                phase_overall_units=(round_index - 1) * 5 + 2,
+                artifacts=br_phase_artifacts,
+                label="active-br-train",
+            ),
         )
         selected_br_checkpoint, selected_br_epoch, br_selection_path, selected_br_candidate = _select_active_slot_checkpoint(
             train_dir=br_train_dir,
@@ -1601,6 +1818,7 @@ def run_ppo_managed_loop(
             workers=resolved_workers,
             inference_server=inference_server,
             enable_status_print=enable_status_print,
+            round_index=round_index,
         )
         br_slot_state = manager.update_active_slot_result(
             slot_name="active_br_slot",
@@ -1642,6 +1860,8 @@ def run_ppo_managed_loop(
                 inference_server=inference_server,
                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
                 seed_start=seed_start + round_index * 50_000,
+                round_index=round_index,
+                enable_status_print=enable_status_print,
             )
             promoted_entries.append(promoted_main)
         if manager.should_promote(lineage="best_response", candidate_payoff=selected_br_candidate.expected_payoff_vs_meta):
@@ -1661,6 +1881,8 @@ def run_ppo_managed_loop(
                 inference_server=inference_server,
                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
                 seed_start=seed_start + round_index * 60_000,
+                round_index=round_index,
+                enable_status_print=enable_status_print,
             )
             promoted_entries.append(promoted_br)
         meta_snapshot = manager.recompute_meta_strategy()

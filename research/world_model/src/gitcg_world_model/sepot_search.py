@@ -310,7 +310,11 @@ class PublicStateReconstructor:
                 opponent_hypothesis=opponent_hypothesis,
             )
             state_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            env = GitcgDecisionEnv(self.env_config, self.matchup)
+            env = GitcgDecisionEnv(
+                self.env_config,
+                self.matchup,
+                enable_result_based_action_relabel=False,
+            )
             context = env.reset(seed=self.config.template_seed, state_json=state_json)
             return env, context
         except Exception:
@@ -323,7 +327,11 @@ class PublicStateReconstructor:
         cache_key = int(acting_player)
         if cache_key in self._template_cache:
             return self._template_cache[cache_key]
-        env = GitcgDecisionEnv(self.env_config, self.matchup)
+        env = GitcgDecisionEnv(
+            self.env_config,
+            self.matchup,
+            enable_result_based_action_relabel=False,
+        )
         try:
             context = env.reset(seed=self.config.template_seed)
             steps = 0
@@ -1030,6 +1038,7 @@ class SePotSearchController:
                 selected_action_code=int(current_context.legal_low_level_codes[candidate_index]),
                 env_config=getattr(env, "_config", None),
                 matchup=getattr(env, "_matchup", None),
+                current_tracker=current_tracker,
                 policy_cache=policy_cache,
                 leaf_value_cache=leaf_value_cache,
             )
@@ -1075,7 +1084,11 @@ class SePotSearchController:
     ) -> float | None:
         if current_sampled_state_json is None or env_config is None or matchup is None:
             return None
-        child_env = GitcgDecisionEnv(env_config, matchup)
+        child_env = GitcgDecisionEnv(
+            env_config,
+            matchup,
+            enable_result_based_action_relabel=False,
+        )
         try:
             child_context = child_env.reset(state_json=current_sampled_state_json)
             matched = match_low_level_code_index(child_context, selected_action_code)

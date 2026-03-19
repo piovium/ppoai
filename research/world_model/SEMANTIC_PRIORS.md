@@ -14,13 +14,34 @@ of hiding them across Python files.
 
 - File:
   - [action_taxonomy.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_taxonomy.toml)
+- ACTION result-semantics rules:
+  - [action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_semantic_rules.toml)
+- Non-ACTION functional rules:
+  - [non_action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/non_action_semantic_rules.toml)
 - Used by:
   - [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
 - Role:
   - defines the current high-level action category names
   - drives the high-level action vocabulary
+  - the ACTION-only result-based rule set, priorities, thresholds, and editable
+    card/entity lists now live in [action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_semantic_rules.toml)
+  - the non-ACTION role / card-function / reroll-color judgments now live in
+    [non_action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/non_action_semantic_rules.toml)
 - Status:
   - active mainline dependency
+  - human-reviewable and editable
+
+### Auxiliary Intent Supervision Draft
+
+- File:
+  - [intent_supervision.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/intent_supervision.toml)
+- Role:
+  - stores optional, higher-level fuzzy intent labels such as survival, lethal,
+    board setup, resource fixing, and tempo
+  - intended for future auxiliary supervision only
+- Status:
+  - not active in runtime decision-making
+  - not active in current PPO objective
   - human-reviewable and editable
 
 ### Shared Semantic Thresholds / Prior Knobs
@@ -28,7 +49,6 @@ of hiding them across Python files.
 - File:
   - [semantic_priors.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/semantic_priors.toml)
 - Used by:
-  - [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
   - [action_quality.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_quality.py)
   - [agents.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/agents.py)
   - [bootstrap_agent.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/bootstrap_agent.py)
@@ -37,7 +57,6 @@ of hiding them across Python files.
   - bootstrap priority order
   - action-quality severities
   - productive-action kind list
-  - high-level action mapping thresholds
 - Status:
   - active mainline dependency
   - hand-authored prior

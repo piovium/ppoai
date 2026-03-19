@@ -7,90 +7,142 @@ active_taxonomy = "mixed_v1"
 
 [intent_v1.ACTION]
 categories = [
-  "skill_commit",
-  "skill_setup",
-  "card_resource",
-  "card_draw_search",
-  "card_buff_equip",
-  "card_board_setup",
-  "card_defense_heal",
-  "switch_tempo",
-  "tune_fix",
-  "declare_end",
+  "chip_frontline_hp",
+  "chip_backline_hp",
+  "force_frontline_lethal",
+  "fortify_frontline",
+  "fortify_team",
+  "switch_character",
+  "cycle_for_cards",
+  "yield_initiative",
+  "burst_setup",
+  "invest_tech",
+  "invest_delayed_damage",
+  "invest_engine_card",
+  "elemental_tuning",
+  "other_action",
 ]
 
 [intent_v1.REROLL_DICE]
 categories = [
   "keep_all",
-  "reroll_minor",
-  "reroll_major",
-  "reroll_all",
+  "keep_active_and_two_backline",
+  "keep_active_and_one_backline",
+  "keep_active_only",
+  "keep_two_backline",
+  "keep_one_backline",
+  "reroll_active_and_two_backline",
+  "reroll_active_and_one_backline",
+  "reroll_active_only",
+  "reroll_two_backline",
+  "reroll_one_backline",
 ]
 
 [intent_v1.CHOOSE_ACTIVE]
 categories = [
-  "choose_mainline",
-  "choose_safety",
-  "choose_setup",
+  "choose_attack",
+  "choose_defense",
+  "choose_heal",
+  "choose_absorb",
+  "choose_support",
+  "choose_other",
 ]
 
 [intent_v1.SELECT_CARD]
 categories = [
-  "keep_core",
-  "keep_curve",
-  "keep_resource",
-  "keep_flex",
+  "select_resource",
+  "select_draw_search",
+  "select_defense_heal",
+  "select_buff_equip",
+  "select_board_setup",
+  "select_engine_card",
+  "select_damage_pressure",
+  "select_core",
+  "select_other",
 ]
 
 [intent_v1.SWITCH_HANDS]
 categories = [
-  "switch_none",
-  "switch_minor",
-  "switch_major",
-  "switch_all",
+  "switch_keep_all",
+  "switch_resource",
+  "switch_draw_search",
+  "switch_defense_heal",
+  "switch_buff_equip",
+  "switch_board_setup",
+  "switch_engine_card",
+  "switch_damage_pressure",
+  "switch_core",
+  "switch_mixed",
+  "switch_other",
 ]
 
 [mixed_v1.ACTION]
 categories = [
-  "skill_commit",
-  "skill_setup",
-  "card_resource",
-  "card_draw_search",
-  "card_buff_equip",
-  "card_board_setup",
-  "card_defense_heal",
-  "switch_tempo",
-  "tune_fix",
-  "declare_end",
+  "chip_frontline_hp",
+  "chip_backline_hp",
+  "force_frontline_lethal",
+  "fortify_frontline",
+  "fortify_team",
+  "switch_character",
+  "cycle_for_cards",
+  "yield_initiative",
+  "burst_setup",
+  "invest_tech",
+  "invest_delayed_damage",
+  "invest_engine_card",
+  "elemental_tuning",
+  "other_action",
 ]
 
 [mixed_v1.REROLL_DICE]
 categories = [
   "keep_all",
-  "reroll_minor",
-  "reroll_major",
-  "reroll_all",
+  "keep_active_and_two_backline",
+  "keep_active_and_one_backline",
+  "keep_active_only",
+  "keep_two_backline",
+  "keep_one_backline",
+  "reroll_active_and_two_backline",
+  "reroll_active_and_one_backline",
+  "reroll_active_only",
+  "reroll_two_backline",
+  "reroll_one_backline",
 ]
 
 [mixed_v1.CHOOSE_ACTIVE]
 categories = [
-  "choose_mainline",
-  "choose_safety",
-  "choose_setup",
+  "choose_attack",
+  "choose_defense",
+  "choose_heal",
+  "choose_absorb",
+  "choose_support",
+  "choose_other",
 ]
 
 [mixed_v1.SELECT_CARD]
 categories = [
-  "keep_core",
-  "keep_curve",
-  "keep_resource",
-  "keep_flex",
+  "select_resource",
+  "select_draw_search",
+  "select_defense_heal",
+  "select_buff_equip",
+  "select_board_setup",
+  "select_engine_card",
+  "select_damage_pressure",
+  "select_core",
+  "select_other",
 ]
 
 [mixed_v1.SWITCH_HANDS]
 categories = [
-  "switch_none",
-  "switch_minor",
-  "switch_major",
-  "switch_all",
+  "switch_keep_all",
+  "switch_resource",
+  "switch_draw_search",
+  "switch_defense_heal",
+  "switch_buff_equip",
+  "switch_board_setup",
+  "switch_engine_card",
+  "switch_damage_pressure",
+  "switch_core",
+  "switch_mixed",
+  "switch_other",
 ]

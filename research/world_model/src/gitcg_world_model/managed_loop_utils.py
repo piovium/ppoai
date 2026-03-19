@@ -62,6 +62,35 @@ def print_episode_analysis(
     )
 
 
+def print_episode_progress(
+    *,
+    label: str,
+    round_index: int,
+    completed: int,
+    total: int,
+    episode: Any,
+    extra: str | None = None,
+) -> None:
+    metadata = dict(getattr(episode, "metadata", {}) or {})
+    opponent = (
+        metadata.get("opponent_policy_id")
+        or metadata.get("opponent_source")
+        or metadata.get("opponent_kind")
+        or extra
+    )
+    print(
+        f"[{label}] "
+        f"round={round_index:04d} "
+        f"{completed}/{total} "
+        f"matchup={getattr(episode, 'matchup', 'unknown')} "
+        f"winner={getattr(episode, 'winner', None)} "
+        f"steps={len(getattr(episode, 'steps', ()))} "
+        f"truncated={bool(metadata.get('truncated'))}"
+        f"{f' opponent={opponent}' if opponent else ''}",
+        flush=True,
+    )
+
+
 def checkpoint_size_mb(path: str | Path) -> float:
     candidate = Path(path)
     if not candidate.exists():

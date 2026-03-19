@@ -2,7 +2,8 @@
 
 ## Purpose
 
-This file documents the **currently active** high-level to low-level action bridge for the new codebook-first pipeline:
+This file documents the **currently active** high-level to low-level action
+bridge for the new codebook-first pipeline:
 
 - `PPO`
 - `Oracle Guiding`
@@ -10,21 +11,27 @@ This file documents the **currently active** high-level to low-level action brid
 - `P2SRO`
 - hierarchical action layer
 
-It is meant to answer two practical questions:
+It answers four practical questions:
 
-1. `现在的高级语义是什么？`
-2. `一个高级语义是怎么接到低级可执行动作上的？`
-
-This is the file to review before changing the current high-level categories.
+1. `当前生效的高级语义是什么？`
+2. `它们怎么和低级可执行动作接起来？`
+3. `当前 ACTION 高级层是按什么标准判断的？`
+4. `以后如果要改，我应该改哪里？`
 
 ## Current Files That Matter
 
 - Category names:
   - [action_taxonomy.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_taxonomy.toml)
-- Thresholds / key names / subjective hierarchy priors:
-  - [semantic_priors.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/semantic_priors.toml)
+- Active ACTION result-semantics rules:
+  - [action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_semantic_rules.toml)
+- Active non-ACTION functional rules:
+  - [non_action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/non_action_semantic_rules.toml)
+- Auxiliary intent draft labels:
+  - [intent_supervision.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/intent_supervision.toml)
 - Runtime mapping logic:
   - [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
+- Runtime ACTION result relabel path:
+  - [action_adapter.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_adapter.py)
 - Low-level executable action enumeration:
   - [action_adapter.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_adapter.py)
 
@@ -83,148 +90,267 @@ These names come from [action_taxonomy.toml](/E:/Coding/WorldModel/research/worl
 
 ### ACTION
 
-- `skill_commit`
-- `skill_setup`
-- `card_resource`
-- `card_draw_search`
-- `card_buff_equip`
-- `card_board_setup`
-- `card_defense_heal`
-- `switch_tempo`
-- `tune_fix`
-- `declare_end`
+- `chip_frontline_hp`
+- `chip_backline_hp`
+- `force_frontline_lethal`
+- `fortify_frontline`
+- `fortify_team`
+- `switch_character`
+- `cycle_for_cards`
+- `yield_initiative`
+- `burst_setup`
+- `invest_tech`
+- `invest_delayed_damage`
+- `invest_engine_card`
+- `elemental_tuning`
+- `other_action`
 
 ### REROLL_DICE
 
 - `keep_all`
-- `reroll_minor`
-- `reroll_major`
-- `reroll_all`
+- `keep_active_and_two_backline`
+- `keep_active_and_one_backline`
+- `keep_active_only`
+- `keep_two_backline`
+- `keep_one_backline`
+- `reroll_active_and_two_backline`
+- `reroll_active_and_one_backline`
+- `reroll_active_only`
+- `reroll_two_backline`
+- `reroll_one_backline`
 
 ### CHOOSE_ACTIVE
 
-- `choose_mainline`
-- `choose_safety`
-- `choose_setup`
+- `choose_attack`
+- `choose_defense`
+- `choose_heal`
+- `choose_absorb`
+- `choose_support`
+- `choose_other`
 
 ### SELECT_CARD
 
-- `keep_core`
-- `keep_curve`
-- `keep_resource`
-- `keep_flex`
+- `select_resource`
+- `select_draw_search`
+- `select_defense_heal`
+- `select_buff_equip`
+- `select_board_setup`
+- `select_engine_card`
+- `select_damage_pressure`
+- `select_core`
+- `select_other`
 
 ### SWITCH_HANDS
 
-- `switch_none`
-- `switch_minor`
-- `switch_major`
-- `switch_all`
+- `switch_keep_all`
+- `switch_resource`
+- `switch_draw_search`
+- `switch_defense_heal`
+- `switch_buff_equip`
+- `switch_board_setup`
+- `switch_engine_card`
+- `switch_damage_pressure`
+- `switch_core`
+- `switch_mixed`
+- `switch_other`
 
-## Current Mapping Rules
+## Current ACTION Mapping Rules
 
-These rules are implemented in `_high_level_key_for_spec(...)` inside [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py).
+There are now **two layers** of ACTION mapping:
 
-The rule inputs are:
+1. a provisional fallback in `_high_level_key_for_spec(...)`
+2. the active runtime result-based relabel in [action_adapter.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_adapter.py)
 
-- the low-level action spec itself
-- current visible state
-- acting player
-- thresholds and key names from [semantic_priors.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/semantic_priors.toml)
+The authoritative ACTION semantics are defined by:
 
-### ACTION rules
+- [action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_semantic_rules.toml)
+- `classify_action_outcome_key(...)` in [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
 
-1. `ACTION_DECLARE_END`
-   - always maps to `declare_end`
+### Runtime flow
 
-2. `ACTION_ELEMENTAL_TUNING`
-   - always maps to `tune_fix`
+For `ACTION` requests, the active path is:
 
-3. `ACTION_SWITCH_ACTIVE`
-   - always maps to `switch_tempo`
+1. enumerate legal low-level actions
+2. build the low-level codebook view
+3. for each legal ACTION low-level action, simulate one step from the current
+   root state
+4. read the pre/post state delta
+5. assign one primary ACTION high-level label
+6. rebuild `legal_high_level_codes` and `high_to_low_map`
 
-4. `ACTION_USE_SKILL`
-   - if the skill has at least one target **and**
-   - `len(used_dice) >= skill_commit_min_used_dice`
-   - then map to `skill_commit`
-   - else map to `skill_setup`
+So the active ACTION high-level layer is now **result-based**, not mainly
+definition-id threshold based.
 
-5. `ACTION_PLAY_CARD`
-   - current version uses a **definition-id threshold split**
-   - the thresholds are:
-     - `defense_heal_min`
-     - `board_setup_min`
-     - `buff_equip_min`
-     - `resource_min`
-   - priority is checked from high threshold to low threshold:
-     - `>= defense_heal_min` -> `card_defense_heal`
-     - else `>= board_setup_min` -> `card_board_setup`
-     - else `>= buff_equip_min` -> `card_buff_equip`
-     - else `>= resource_min` -> `card_resource`
-     - else -> `card_draw_search`
+### Delta features currently used
+
+- opponent frontline HP loss
+- opponent backline HP loss total
+- opponent frontline lethal
+- self frontline tank delta
+- self team tank delta
+- self team HP gain count
+- self frontline energy delta
+- self burst-ready delta
+- self hand-count delta
+- self support delta
+- self summon delta
+- self durable-status delta
+- future damage asset delta
+
+### ACTION labels and how they are recognized
+
+- `force_frontline_lethal`
+  - opponent frontline changes from alive to defeated
+  - this has higher priority than ordinary frontline chip
+- `chip_frontline_hp`
+  - opponent frontline loses HP
+- `chip_backline_hp`
+  - opponent backline characters lose HP
+- `fortify_team`
+  - self team tankiness rises and at least two characters gain HP
+- `fortify_frontline`
+  - self frontline tankiness rises
+- `switch_character`
+  - `ACTION_SWITCH_ACTIVE`
+- `cycle_for_cards`
+  - own hand count rises, or the played card is in the editable cycling card list
+- `yield_initiative`
+  - currently mainly `ACTION_DECLARE_END`
+- `burst_setup`
+  - self frontline energy rises, or burst-ready count rises, or card is in the editable burst-setup card list
+- `invest_delayed_damage`
+  - future damage assets rise, or card is in the editable delayed-damage card list
+- `invest_engine_card`
+  - card is in the editable engine-card list
+- `invest_tech`
+  - card is in the editable tech-card list, or support / durable setup rises
+- `elemental_tuning`
+  - `ACTION_ELEMENTAL_TUNING`
+- `other_action`
+  - narrow fallback only when nothing else matches
+
+Note:
+
+- `ACTION_DECLARE_END`, `ACTION_SWITCH_ACTIVE`, and `ACTION_ELEMENTAL_TUNING`
+  still have real downstream game consequences.
+- The current implementation skips the extra one-step relabel simulation only
+  because, under the **current ACTION taxonomy**, their primary high-level label
+  is defined directly by the action type itself:
+  - `ACTION_DECLARE_END` -> `yield_initiative`
+  - `ACTION_SWITCH_ACTIVE` -> `switch_character`
+  - `ACTION_ELEMENTAL_TUNING` -> `elemental_tuning`
+- This is an implementation shortcut for the current label system, not a claim
+  that those actions have no state impact.
+
+### Editable card / entity lists
+
+The subjective card-group parts are **not** hidden in Python. They live in:
+
+- [action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_semantic_rules.toml)
+
+Current editable groups include:
+
+- `cycle_card_ids`
+- `burst_setup_card_ids`
+- `engine_card_ids`
+- `tech_card_ids`
+- `delayed_damage_card_ids`
+- `defensive_entity_definition_ids`
+- `offensive_entity_definition_ids`
+
+If you disagree with any current card-to-category seed, edit this file first.
+
+## Current Non-ACTION Mapping Rules
+
+Non-`ACTION` request types now use the request-specific functional rule path in
+`_high_level_key_for_spec(...)` inside [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py),
+backed by:
+
+- [non_action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/non_action_semantic_rules.toml)
 
 ### REROLL_DICE rules
 
-Use reroll subset size relative to current visible dice count:
+Use current visible dice plus the current team color profile:
 
-- no dice rerolled -> `keep_all`
-- reroll count == total dice -> `reroll_all`
-- reroll count <= `reroll_minor_max` -> `reroll_minor`
-- otherwise -> `reroll_major`
+- `keep_all`
+  - reroll mask is empty
+- the remaining 10 labels are chosen by comparing:
+  - which team-color dice are mostly kept
+  - which team-color dice are mostly rerolled
+  - whether the kept/rerolled focus is:
+    - active only
+    - active + one backline color
+    - active + two backline colors
+    - one backline color
+    - two backline colors
+- backline order is ignored
+- duplicate backline colors collapse to distinct color classes
+- off-team / omni dice are treated as "other colors" and help break ties
+- this keeps the semantics close to:
+  - 保留哪些己方角色元素色
+  - 或者反过来换掉哪些己方角色元素色
 
 ### CHOOSE_ACTIVE rules
 
-Look at the chosen slot's visible character state:
+Look up the chosen character definition id in the editable role groups:
 
-- if `health / max_health <= choose_safety_health_ratio`
-  - -> `choose_safety`
-- else if `energy >= max_energy - choose_setup_energy_gap`
-  - -> `choose_setup`
-- else
-  - -> `choose_mainline`
+- `choose_attack`
+- `choose_defense`
+- `choose_heal`
+- `choose_absorb`
+- `choose_support`
+- otherwise -> `choose_other`
+
+These role groups are explicit and editable in
+[non_action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/non_action_semantic_rules.toml).
 
 ### SELECT_CARD rules
 
-Use the selected card definition id and threshold bands:
+Use the selected card definition id and map it to an explicit card-function
+group:
 
-- `>= resource_min` -> `keep_resource`
-- else `>= curve_min` -> `keep_curve`
-- else `>= core_min` -> `keep_core`
-- else -> `keep_flex`
+- `select_resource`
+- `select_draw_search`
+- `select_defense_heal`
+- `select_buff_equip`
+- `select_board_setup`
+- `select_engine_card`
+- `select_damage_pressure`
+- `select_core`
+- otherwise -> `select_other`
 
 ### SWITCH_HANDS rules
 
-Use removed-hand count relative to current hand size:
+Use the removed hand cards' function groups:
 
-- remove none -> `switch_none`
-- remove all -> `switch_all`
-- remove count <= `switch_minor_max` -> `switch_minor`
-- else -> `switch_major`
+- remove none -> `switch_keep_all`
+- all removed cards in one function group -> `switch_<group>`
+- removed cards span multiple groups -> `switch_mixed`
+- all removed cards unknown to the current function table -> `switch_other`
 
 ## How High-Level Connects to Low-Level During Training
 
-The actual bridge is built at runtime in [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py):
+The bridge is built at runtime in [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py):
 
 1. `ActionLegalityEngine.encode_legal_actions(...)`
    - registers legal low-level specs
    - assigns low-level action codes
-   - assigns one high-level code to each low-level code
-   - builds:
-     - `legal_low_level_codes`
-     - `legal_high_level_codes`
-     - `high_to_low_map`
-
-2. `aggregate_high_policy(...)`
+   - assigns provisional high-level codes
+2. `build_decision_context(...)` in [action_adapter.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_adapter.py)
+   - for `ACTION`, optionally relabels high-level codes using one-step outcome deltas
+   - rebuilds `high_to_low_map`
+3. `aggregate_high_policy(...)`
    - takes a low-level teacher/search policy
    - sums probability mass over the low-level actions belonging to each high-level bucket
    - produces the current high-level training target
 
-So the current system does:
+So the current system still does:
 
 - low-level teacher/search distribution first
 - high-level target second
 
-This is why the high-level head is structurally tied to the low-level layer instead of floating independently.
+This is why the high-level head is structurally tied to the low-level layer
+instead of floating independently.
 
 ## Why One Low-Level Action Gets One Primary High-Level Label
 
@@ -238,87 +364,23 @@ Reason:
 
 This is a deliberate engineering choice.
 
-It means the current high-level layer is:
+It means the current active high-level layer is:
 
 - structured
 - auditable
-- stable
+- state-aware
 
-but not yet meant to perfectly capture every fuzzy human intention.
-
-## What To Edit If You Want To Change The Current High-Level Layer
-
-### If you only want to rename categories
-
-Edit:
-
-- [action_taxonomy.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_taxonomy.toml)
-- [semantic_priors.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/semantic_priors.toml)
-
-You must keep names aligned between:
-
-- taxonomy category names
-- `action_hierarchy.keys.*`
-
-### If you want to change thresholds but keep the same branch structure
-
-Edit:
-
-- [semantic_priors.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/semantic_priors.toml)
-
-Specifically:
-
-- `[action_hierarchy.thresholds]`
-- `[action_hierarchy.action_card_thresholds]`
-- `[action_hierarchy.select_card_thresholds]`
-
-### If you want to change the actual classification logic
-
-Edit:
-
-- [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
-
-Function to edit:
-
-- `_high_level_key_for_spec(...)`
-
-This is the place where:
-
-- branch order
-- visible-state conditions
-- label assignment logic
-
-are defined.
-
-## Recommendation: Keep Current High-Level Layer Mechanistic
-
-Right now the safest role for the active high-level layer is:
-
-- mechanism-oriented grouping
-- one primary bucket per low-level action
-- execution-safe mapping
-
-Examples:
-
-- `skill_commit`
-- `card_resource`
-- `switch_tempo`
-- `tune_fix`
-
-This is more stable than directly making the active high-level layer be:
-
-- `保命`
-- `斩杀`
-- `骗反应`
-- `压节奏`
-
-because those are often fuzzy and overlapping.
+but still not meant to perfectly capture every fuzzy human intention.
 
 ## Draft: Extra Intent Layer (Auxiliary Only, Not Active)
 
 The following idea is **not active in the current runtime or training path**.
 
 It is a draft for future auxiliary supervision only.
+
+The editable draft labels live in:
+
+- [intent_supervision.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/intent_supervision.toml)
 
 ### Intended role
 
@@ -343,47 +405,31 @@ This intent layer should:
 
 but it should **not** replace the current executable low-level action space.
 
-### Suggested label source
-
-If added later, the best source is **soft labels**, not hard single labels.
-
-Recommended sources:
-
-- SePoT rollout deltas
-- teacher search deltas
-- critic value deltas
-
-Examples:
-
-- `保命` score:
-  - how much the action improves future survival value
-- `斩杀` score:
-  - how much the action improves kill probability or lethal line
-- `资源修复` score:
-  - how much the action improves future legal high-value action coverage
-
-### Recommended form
-
-If added later:
-
-- use **multi-label** or multi-score intent targets
-- do **not** force one exclusive intent label
-- keep it auxiliary
-
 ### Current status
 
-- not wired into runtime
-- not wired into active PPO objective
-- safe to discuss and hand-edit later without blocking the current mainline
+- taxonomy exists
+- intent draft labels exist
+- but the numeric soft-label computation is **not implemented yet**
 
 ## Practical Edit Workflow
 
-If you want to revise the active high-level layer later, use this order:
+If you want to revise the active ACTION high-level layer later, use this order:
 
 1. edit category names in [action_taxonomy.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_taxonomy.toml)
-2. edit thresholds and label keys in [semantic_priors.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/semantic_priors.toml)
-3. edit `_high_level_key_for_spec(...)` in [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
+2. edit result-based rules, priorities, and card/entity lists in [action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_semantic_rules.toml)
+3. edit `classify_action_outcome_key(...)` and related feature code in [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
 4. rerun action-hierarchy and pipeline tests
+
+If you want to revise the active non-`ACTION` high-level layer later, use:
+
+1. edit category names in [action_taxonomy.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_taxonomy.toml)
+2. edit role / card-function / reroll-color rules in [non_action_semantic_rules.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/non_action_semantic_rules.toml)
+3. edit the request-specific rule functions in [action_hierarchy.py](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/action_hierarchy.py)
+4. rerun action-hierarchy tests
+
+If you want to revise the auxiliary fuzzy intent layer later, edit:
+
+- [intent_supervision.toml](/E:/Coding/WorldModel/research/world_model/src/gitcg_world_model/intent_supervision.toml)
 
 This keeps the system understandable for:
 

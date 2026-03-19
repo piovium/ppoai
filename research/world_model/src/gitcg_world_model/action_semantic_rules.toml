@@ -1,0 +1,173 @@
+# Human-reviewable result-based ACTION semantic rules.
+# This file only governs the currently active ACTION high-level layer.
+# Non-ACTION request types still use the simpler request-specific taxonomy in
+# action_taxonomy.toml + semantic_priors.toml.
+
+active_profile = "result_action_v1"
+
+[result_action_v1]
+action_categories = [
+  "chip_frontline_hp",
+  "chip_backline_hp",
+  "force_frontline_lethal",
+  "fortify_frontline",
+  "fortify_team",
+  "switch_character",
+  "cycle_for_cards",
+  "yield_initiative",
+  "burst_setup",
+  "invest_tech",
+  "invest_delayed_damage",
+  "invest_engine_card",
+  "elemental_tuning",
+  "other_action",
+]
+
+[result_action_v1.category_definitions.chip_frontline_hp]
+zh = "消耗对方前台角色血量"
+priority = 110
+depends_on = ["opponent_frontline_hp_loss"]
+
+[result_action_v1.category_definitions.chip_backline_hp]
+zh = "消耗对方后台角色血量"
+priority = 100
+depends_on = ["opponent_backline_hp_loss_total"]
+
+[result_action_v1.category_definitions.force_frontline_lethal]
+zh = "强行击杀对方前台角色"
+priority = 120
+depends_on = ["opponent_frontline_lethal"]
+
+[result_action_v1.category_definitions.fortify_frontline]
+zh = "提升我方前台角色坦度"
+priority = 80
+depends_on = ["self_frontline_tank_delta"]
+
+[result_action_v1.category_definitions.fortify_team]
+zh = "提升我方全体角色坦度"
+priority = 90
+depends_on = ["self_team_tank_delta", "self_team_hp_gain_count"]
+
+[result_action_v1.category_definitions.switch_character]
+zh = "切换角色"
+priority = 70
+depends_on = ["action_kind"]
+
+[result_action_v1.category_definitions.cycle_for_cards]
+zh = "过牌（用行动机会换手牌机会）"
+priority = 60
+depends_on = ["self_hand_count_delta", "cycle_card_ids"]
+
+[result_action_v1.category_definitions.yield_initiative]
+zh = "让动"
+priority = 10
+depends_on = ["action_kind", "is_fast"]
+
+[result_action_v1.category_definitions.burst_setup]
+zh = "蓄爆"
+priority = 50
+depends_on = ["self_frontline_energy_delta", "self_burst_ready_delta", "burst_setup_card_ids"]
+
+[result_action_v1.category_definitions.invest_tech]
+zh = "投资科技"
+priority = 30
+depends_on = ["tech_card_ids", "self_support_delta", "self_durable_status_delta"]
+
+[result_action_v1.category_definitions.invest_delayed_damage]
+zh = "投资延迟伤害"
+priority = 40
+depends_on = ["future_damage_asset_delta", "delayed_damage_card_ids"]
+
+[result_action_v1.category_definitions.invest_engine_card]
+zh = "投资体系卡（冒险等终端）"
+priority = 35
+depends_on = ["engine_card_ids"]
+
+[result_action_v1.category_definitions.elemental_tuning]
+zh = "元素调和"
+priority = 20
+depends_on = ["action_kind"]
+
+[result_action_v1.category_definitions.other_action]
+zh = "其他（极小兜底）"
+priority = 0
+depends_on = []
+
+[result_action_v1.priorities]
+force_frontline_lethal = 120
+chip_frontline_hp = 110
+chip_backline_hp = 100
+fortify_team = 90
+fortify_frontline = 80
+switch_character = 70
+cycle_for_cards = 60
+burst_setup = 50
+invest_delayed_damage = 40
+invest_engine_card = 35
+invest_tech = 30
+elemental_tuning = 20
+yield_initiative = 10
+other_action = 0
+
+[result_action_v1.thresholds]
+min_frontline_hp_loss = 1
+min_backline_hp_loss = 1
+min_frontline_tank_gain = 1
+min_team_tank_gain = 2
+min_team_hp_gain_count = 2
+min_frontline_energy_gain = 1
+min_burst_ready_gain = 1
+min_hand_count_gain = 1
+min_future_damage_asset_gain = 1
+min_support_gain = 1
+min_durable_status_gain = 1
+
+[result_action_v1.card_groups]
+# draw / search / filter
+cycle_card_ids = [
+  321002, # Knights of Favonius Library
+  322009, # Chang the Ninth
+  332002, # Changing Shifts
+  332003, # Toss-Up
+  332004, # Strategize
+]
+
+# cards whose primary role is to prepare burst / energy payoff windows
+burst_setup_card_ids = [
+  214111, # To Ward Weakness
+  312025, # Golden Troupe's Reward
+]
+
+# engine cards / long-lived value infrastructure
+engine_card_ids = [
+  312029, # Gladiator's Triumphus
+  321002, # Knights of Favonius Library
+  321011, # Vanarana
+  321016, # Weeping Willow of the Lake
+  322002, # Katheryne
+  322009, # Chang the Ninth
+  322025, # The White Glove and the Fisherman
+]
+
+# technology / setup cards that improve future optionality or board quality
+tech_card_ids = [
+  215101, # They Call Her Cloud Retainer
+  216091, # In Five Colors Dyed
+  222031, # Surging Undercurrent
+  311503, # Aquila Favonia
+  312021, # Heart of Khvarena's Brilliance
+  330005, # In Every House a Stove
+  330008, # Vicious Ancient Battle
+  331601, # Elemental Resonance: Woven Stone
+  332006, # Leave It to Me!
+]
+
+# cards whose main value is delayed pressure / future damage payoff
+delayed_damage_card_ids = [
+  323004, # Treasure-Seeking Seelie
+]
+
+[result_action_v1.entity_groups]
+# Optional editable lists for future refinement. They are deliberately external.
+defensive_entity_definition_ids = []
+offensive_entity_definition_ids = []

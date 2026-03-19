@@ -27,7 +27,3 @@ def option_kind_priority_map(section_path: tuple[str, ...]) -> dict[OptionKind, 
 
 def action_quality_config() -> dict[str, Any]:
     return dict(load_semantic_priors()["action_quality"])
-
-
-def action_hierarchy_config() -> dict[str, Any]:
-    return dict(load_semantic_priors()["action_hierarchy"])

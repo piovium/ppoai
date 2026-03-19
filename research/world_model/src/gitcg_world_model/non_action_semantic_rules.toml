@@ -1,0 +1,92 @@
+# Human-reviewable non-ACTION semantic rules.
+# These rules drive the currently active high-level semantics for:
+# - REROLL_DICE
+# - CHOOSE_ACTIVE
+# - SELECT_CARD
+# - SWITCH_HANDS
+#
+# They are intentionally externalized so role / function / element judgments do
+# not stay hidden in Python control flow.
+
+active_profile = "functional_v1"
+
+[functional_v1.reroll.character_elements]
+1411 = 4 # 久岐忍 / Electro
+1510 = 5 # 闲云 / Anemo
+2103 = 1 # 冰元素方碑 / Cryo
+1609 = 6 # 千织 / Geo
+2203 = 2 # 深渊咏者·渊火？当前小池是 Wicked Torrents / Hydro
+1608 = 6 # 娜维娅 / Geo
+
+[functional_v1.choose_active.roles]
+attack = [1609, 2203, 1608]
+defense = []
+heal = [1411]
+absorb = [2103]
+support = [1510]
+
+[functional_v1.choose_active.priority]
+order = ["attack", "defense", "heal", "absorb", "support"]
+
+[functional_v1.card_functions.groups]
+resource = [
+  331601, # Elemental Resonance: Woven Stone
+  332005, # Bestest Travel Companion!
+  332006, # Leave It to Me!
+]
+draw_search = [
+  321002, # Knights of Favonius Library
+  322009, # Chang the Ninth
+  332003, # Toss-Up
+  332004, # Strategize
+]
+defense_heal = [
+  214111, # To Ward Weakness
+  333003, # food / heal seed
+  333004, # food / heal seed
+]
+buff_equip = [
+  311503, # Aquila Favonia
+  312021, # artifact seed
+  312025, # artifact seed
+  312029, # artifact seed
+]
+board_setup = [
+  321011, # Vanarana
+  322002, # Katheryne
+  322025, # The White Glove and the Fisherman
+  323004, # Treasure-Seeking Seelie
+]
+engine_card = [
+  321002,
+  321011,
+  321016,
+  322002,
+  322009,
+  322025,
+]
+damage_pressure = [
+  215101, # talent seed
+  216091, # talent seed
+  222031, # talent seed
+  323004, # delayed damage / summon pressure
+  330008, # pressure event seed
+]
+core = [
+  214111,
+  215101,
+  216091,
+  222031,
+]
+
+[functional_v1.card_functions.priority]
+groups = [
+  "resource",
+  "draw_search",
+  "defense_heal",
+  "buff_equip",
+  "board_setup",
+  "engine_card",
+  "damage_pressure",
+  "core",
+]

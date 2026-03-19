@@ -191,7 +191,6 @@ class TrajectoryStep:
     chosen_high_level_code: int | None = None
     player_view: StateSnapshot | None = None
     full_state_json_before: str | None = None
-    full_state_json_after: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
