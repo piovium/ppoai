@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+import gitcg_world_model.sepot_search as sepot_search_module
 from gitcg_world_model.ppo_agent import PpoAgent
 from gitcg_world_model.ppo_features import TokenObservationEncoder
 from gitcg_world_model.ppo_model import PpoModelConfig, PpoTransformerPolicy
@@ -244,6 +246,100 @@ class SePotSearchTests(unittest.TestCase):
         self.assertEqual(metadata_a["sepot_triggered"], metadata_b["sepot_triggered"])
         self.assertEqual(metadata_a["sepot_fallback_reason"], metadata_b["sepot_fallback_reason"])
         self.assertEqual(metadata_a.get("search_teacher_policy"), metadata_b.get("search_teacher_policy"))
+
+    def test_rollout_keeps_partial_branch_scores_when_budget_is_exhausted(self):
+        episode = synthetic_episode_record()
+        step = next(item for item in episode.steps if item.request_type.value == "action")
+        context = DecisionContext(
+            acting_player=step.acting_player,
+            request_type=step.request_type,
+            step_index=0,
+            full_state=step.pre_state,
+            legal_low_level_codes=step.legal_low_level_codes,
+            legal_low_level_mask=step.legal_low_level_mask,
+            legal_high_level_codes=step.legal_high_level_codes,
+            high_to_low_map=step.high_to_low_map,
+            player_view=step.player_view,
+            metadata={
+                "matchup": episode.matchup,
+                "opponent_deck_name": "sample_b",
+            },
+            full_state_json="{}",
+        )
+        self.assertGreaterEqual(len(context.legal_low_level_codes), 2)
+
+        encoder = TokenObservationEncoder()
+        controller = SePotSearchController(card_vocabulary=encoder.config.card_vocabulary)
+        tracker = PublicStateTracker(player_id=0)
+        budget = phase_budget_for_context(context, config=controller.config)
+        belief = build_public_belief_state(
+            context=context,
+            tracker=tracker,
+            card_vocabulary=encoder.config.card_vocabulary,
+            opponent_deck_name="sample_b",
+            belief_histogram=(0.0,) * encoder.belief_histogram_dim,
+            belief_remaining_deck_histogram=(0.0,) * encoder.belief_remaining_deck_histogram_dim,
+            belief_samples=budget.belief_samples,
+            root_player=0,
+        )
+
+        call_count = {"value": 0}
+
+        def fake_advance_until_action(**kwargs):
+            return (
+                kwargs["current_context"],
+                kwargs["current_sampled_state_json"],
+                kwargs["current_public_belief"],
+                kwargs["current_history"],
+                kwargs["sampled_self_hypothesis"],
+                kwargs["sampled_opponent_hypothesis"],
+                kwargs["current_tracker"],
+            )
+
+        def fake_internal_candidate(**kwargs):
+            del kwargs
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                return 0.42
+            raise sepot_search_module._SearchTimeout()
+
+        controller._advance_until_action = fake_advance_until_action  # type: ignore[method-assign]
+        controller._evaluate_internal_self_candidate = fake_internal_candidate  # type: ignore[method-assign]
+
+        dummy_env = type("DummyEnv", (), {"_config": None, "_matchup": None})()
+        sampled_self = belief.self_range.hypotheses[0]
+        sampled_opponent = belief.opponent_range.hypotheses[0]
+        fake_log_probs = tuple(
+            float(len(context.legal_low_level_codes) - index)
+            for index in range(len(context.legal_low_level_codes))
+        )
+
+        with patch.object(sepot_search_module, "_policy_log_probs", return_value=fake_log_probs):
+            value = controller._rollout_value(
+                env=dummy_env,
+                current_context=context,
+                current_sampled_state_json="{}",
+                current_public_belief=belief,
+                current_history=[],
+                root_player=0,
+                budget=budget,
+                depth_remaining=1,
+                model=None,
+                encoder=encoder,
+                device=torch.device("cpu"),
+                opponent_deck_name="sample_b",
+                search_state_value_fn=lambda **_: torch.tensor([0.0], dtype=torch.float32),
+                deadline=1.0e9,
+                updater=None,
+                sampled_self_hypothesis=sampled_self,
+                sampled_opponent_hypothesis=sampled_opponent,
+                current_tracker=tracker,
+                policy_cache={},
+                leaf_value_cache={},
+            )
+
+        self.assertAlmostEqual(value, 0.42, places=6)
+        self.assertEqual(call_count["value"], 2)
 
 
 if __name__ == "__main__":

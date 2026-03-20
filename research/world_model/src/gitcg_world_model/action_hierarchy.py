@@ -293,6 +293,8 @@ def high_action_vocab_size() -> int:
     return len(default_hierarchical_action_codebook().high_level_specs)
 
 def legal_low_level_specs(context: DecisionContext) -> tuple[LowLevelActionSpec, ...]:
+    if context.legal_low_level_specs:
+        return tuple(context.legal_low_level_specs)
     return tuple(low_level_spec_for_code(int(code)) for code in context.legal_low_level_codes)
 
 
@@ -304,6 +306,9 @@ def selected_low_level_code(step) -> int | None:
 
 
 def selected_low_level_spec(step) -> LowLevelActionSpec | None:
+    stored = getattr(step, "chosen_low_level_spec", None)
+    if stored is not None:
+        return stored
     action_code = selected_low_level_code(step)
     if action_code is None:
         return None
@@ -336,6 +341,10 @@ def low_level_kind_for_code(action_code: int) -> OptionKind:
 
 def semantic_action_key_for_code(action_code: int) -> tuple[Any, ...]:
     spec = low_level_spec_for_code(int(action_code))
+    return semantic_action_key_for_spec(spec)
+
+
+def semantic_action_key_for_spec(spec: LowLevelActionSpec) -> tuple[Any, ...]:
     return (
         ("request_type", spec.request_type.value),
         ("kind", spec.kind.value),
@@ -361,6 +370,10 @@ def semantic_action_key_for_code(action_code: int) -> tuple[Any, ...]:
 
 def public_spent_dice_for_code(action_code: int) -> int:
     spec = low_level_spec_for_code(int(action_code))
+    return public_spent_dice_for_spec(spec)
+
+
+def public_spent_dice_for_spec(spec: LowLevelActionSpec) -> int:
     if spec.kind == OptionKind.ACTION_ELEMENTAL_TUNING:
         return 0
     return len(spec.used_dice)
@@ -368,12 +381,14 @@ def public_spent_dice_for_code(action_code: int) -> int:
 
 def match_low_level_code_index(context: DecisionContext, reference_action_code: int) -> int | None:
     reference_key = semantic_action_key_for_code(int(reference_action_code))
-    legal_codes = (
-        tuple(int(code) for code in context.legal_low_level_codes)
-        if context.legal_low_level_codes
-        else tuple(int(spec.action_code) for spec in legal_low_level_specs(context))
-    )
-    for index, action_code in enumerate(legal_codes):
+    specs = legal_low_level_specs(context)
+    if specs:
+        for index, spec in enumerate(specs):
+            candidate_key = semantic_action_key_for_spec(spec)
+            if candidate_key == reference_key:
+                return index
+        return None
+    for index, action_code in enumerate(context.legal_low_level_codes):
         candidate_key = semantic_action_key_for_code(int(action_code))
         if candidate_key == reference_key:
             return index

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .action_hierarchy import legal_low_level_specs
-from .semantic_priors import option_kind_priority_map
+from .action_hierarchy import high_level_spec_for_code, legal_low_level_specs
+from .semantic_priors import option_kind_priority_map, string_sequence
 from .schema import ActionChoice, DecisionContext, DecisionType, OptionKind
 
 
@@ -33,9 +33,15 @@ class ScriptedBootstrapAgent:
     ) -> ActionChoice:
         available = tuple(zip(available_codes, available_specs, strict=False))
         if context.request_type == DecisionType.REROLL_DICE:
-            for action_code, option in available:
-                if option.reroll_dice_mask == 0:
-                    return ActionChoice(action_code=int(action_code))
+            ranked = sorted(
+                available,
+                key=lambda pair: self._reroll_rank(
+                    pair[0],
+                    pair[1],
+                    context=context,
+                ),
+            )
+            return ActionChoice(action_code=int(ranked[0][0]))
         if context.request_type == DecisionType.SWITCH_HANDS:
             for action_code, option in available:
                 if option.switch_hand_slot_mask == 0:
@@ -50,3 +56,29 @@ class ScriptedBootstrapAgent:
         is_fast = 0 if option.metadata.get("is_fast") else 1
         used_dice = len(option.used_dice)
         return (priority, is_fast, used_dice, option.label)
+
+    def _reroll_rank(
+        self,
+        action_code: int,
+        option,
+        *,
+        context: DecisionContext,
+    ) -> tuple[int, int, str]:
+        category = self._high_level_key_for_code(context, action_code)
+        order = string_sequence(("agents", "bootstrap", "reroll_high_priority"))
+        try:
+            category_rank = int(order.index(category))
+        except ValueError:
+            category_rank = len(order)
+        rerolled_count = int(option.reroll_dice_mask).bit_count()
+        return (
+            category_rank,
+            -rerolled_count,
+            str(option.label),
+        )
+
+    def _high_level_key_for_code(self, context: DecisionContext, action_code: int) -> str:
+        for high_code, low_codes in context.high_to_low_map:
+            if int(action_code) in (int(code) for code in low_codes):
+                return str(high_level_spec_for_code(int(high_code)).key)
+        return ""

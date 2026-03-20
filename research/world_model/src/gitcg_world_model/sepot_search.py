@@ -54,9 +54,11 @@ class SePotPhaseBudget:
 class SePotSearchConfig:
     enabled: bool = True
     uncertainty_penalty: float = 0.15
-    opening_timeout_ms: int = 1200
-    midgame_timeout_ms: int = 1800
-    endgame_timeout_ms: int = 2500
+    # Runtime SePoT should stay in the low-hundreds of milliseconds. Larger
+    # budgets make fallback latency dominate the whole acting pipeline.
+    opening_timeout_ms: int = 120
+    midgame_timeout_ms: int = 180
+    endgame_timeout_ms: int = 250
     template_seed: int = 11
     max_template_steps: int = 96
 
@@ -717,48 +719,59 @@ class SePotSearchController:
                 belief_sample_count=public_belief.opponent_range.count,
             )
         root_scores: dict[int, tuple[float, float]] = {}
+        timed_out = False
         for root_index in root_indices:
             if time.perf_counter() > deadline:
-                return _fallback_decision(
-                    reason="timeout",
-                    policy_log_probs=policy_log_probs,
-                    phase_depth=budget.depth,
-                    belief_sample_count=public_belief.opponent_range.count,
-                )
+                timed_out = True
+                break
             candidate_action_code = int(context.legal_low_level_codes[root_index])
             sample_values: list[float] = []
             sample_weights: list[float] = []
+            candidate_timed_out = False
             for hypothesis in public_belief.opponent_range.hypotheses[: budget.belief_samples]:
-                branch_value = self._evaluate_root_candidate(
-                    root_context=context,
-                    root_history=history,
-                    root_tracker=root_tracker,
-                    root_public_belief=public_belief,
-                    root_action_code=candidate_action_code,
-                    sampled_opponent_hypothesis=hypothesis,
-                    model=model,
-                    encoder=encoder,
-                    device=device,
-                    budget=budget,
-                    deadline=deadline,
-                    reconstructor=reconstructor,
-                    updater=updater,
-                    opponent_deck_name=opponent_deck_name,
-                    search_state_value_fn=search_state_value_fn,
-                    policy_cache=policy_cache,
-                    leaf_value_cache=leaf_value_cache,
-                )
+                if time.perf_counter() > deadline:
+                    timed_out = True
+                    candidate_timed_out = True
+                    break
+                try:
+                    branch_value = self._evaluate_root_candidate(
+                        root_context=context,
+                        root_history=history,
+                        root_tracker=root_tracker,
+                        root_public_belief=public_belief,
+                        root_action_code=candidate_action_code,
+                        sampled_opponent_hypothesis=hypothesis,
+                        model=model,
+                        encoder=encoder,
+                        device=device,
+                        budget=budget,
+                        deadline=deadline,
+                        reconstructor=reconstructor,
+                        updater=updater,
+                        opponent_deck_name=opponent_deck_name,
+                        search_state_value_fn=search_state_value_fn,
+                        policy_cache=policy_cache,
+                        leaf_value_cache=leaf_value_cache,
+                    )
+                except _SearchTimeout:
+                    timed_out = True
+                    candidate_timed_out = True
+                    break
                 if branch_value is None:
                     continue
                 sample_values.append(float(branch_value))
                 sample_weights.append(max(1.0e-6, float(hypothesis.weight)))
             if not sample_values:
+                if candidate_timed_out:
+                    break
                 continue
             mean_value, std_value = _weighted_mean_std(sample_values, sample_weights)
             root_scores[root_index] = (mean_value, std_value)
+            if candidate_timed_out:
+                break
         if not root_scores:
             return _fallback_decision(
-                reason="reconstruction_failed",
+                reason=("timeout" if timed_out else "reconstruction_failed"),
                 policy_log_probs=policy_log_probs,
                 phase_depth=budget.depth,
                 belief_sample_count=public_belief.opponent_range.count,
@@ -868,7 +881,7 @@ class SePotSearchController:
             finally:
                 env.close()
         except _SearchTimeout:
-            return None
+            raise
 
     def _rollout_value(
         self,
@@ -898,7 +911,15 @@ class SePotSearchController:
         leaf_value_cache: dict[tuple[Any, ...], float],
     ) -> float:
         if time.perf_counter() > deadline:
-            raise _SearchTimeout()
+            return _leaf_value(
+                public_belief=current_public_belief,
+                current_context=current_context,
+                budget=budget,
+                card_vocabulary=self.card_vocabulary,
+                device=device,
+                search_state_value_fn=search_state_value_fn,
+                cache=leaf_value_cache,
+            )
         if current_context is None or current_context.terminal:
             return _leaf_value(
                 public_belief=current_public_belief,
@@ -1019,29 +1040,32 @@ class SePotSearchController:
         branch_scores: list[float] = []
         for candidate_index in candidate_indices:
             if time.perf_counter() > deadline:
-                raise _SearchTimeout()
-            branch_value = self._evaluate_internal_self_candidate(
-                current_context=current_context,
-                current_sampled_state_json=current_sampled_state_json,
-                current_public_belief=current_public_belief,
-                current_history=current_history,
-                root_player=root_player,
-                budget=budget,
-                depth_remaining=depth_remaining,
-                model=model,
-                encoder=encoder,
-                device=device,
-                opponent_deck_name=opponent_deck_name,
-                search_state_value_fn=search_state_value_fn,
-                deadline=deadline,
-                updater=updater,
-                selected_action_code=int(current_context.legal_low_level_codes[candidate_index]),
-                env_config=getattr(env, "_config", None),
-                matchup=getattr(env, "_matchup", None),
-                current_tracker=current_tracker,
-                policy_cache=policy_cache,
-                leaf_value_cache=leaf_value_cache,
-            )
+                break
+            try:
+                branch_value = self._evaluate_internal_self_candidate(
+                    current_context=current_context,
+                    current_sampled_state_json=current_sampled_state_json,
+                    current_public_belief=current_public_belief,
+                    current_history=current_history,
+                    root_player=root_player,
+                    budget=budget,
+                    depth_remaining=depth_remaining,
+                    model=model,
+                    encoder=encoder,
+                    device=device,
+                    opponent_deck_name=opponent_deck_name,
+                    search_state_value_fn=search_state_value_fn,
+                    deadline=deadline,
+                    updater=updater,
+                    selected_action_code=int(current_context.legal_low_level_codes[candidate_index]),
+                    env_config=getattr(env, "_config", None),
+                    matchup=getattr(env, "_matchup", None),
+                    current_tracker=current_tracker,
+                    policy_cache=policy_cache,
+                    leaf_value_cache=leaf_value_cache,
+                )
+            except _SearchTimeout:
+                break
             if branch_value is not None:
                 branch_scores.append(float(branch_value))
         if not branch_scores:

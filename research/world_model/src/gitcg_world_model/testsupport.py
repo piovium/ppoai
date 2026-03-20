@@ -101,14 +101,21 @@ def encode_step_actions(
     if action_code < 0 and encoded.legal_low_level_codes:
         action_code = int(encoded.legal_low_level_codes[0])
     chosen_high = low_to_high.get(action_code) if action_code >= 0 else None
+    chosen_spec = None
+    for code, spec in zip(encoded.legal_low_level_codes, materialized_specs, strict=False):
+        if int(code) == action_code:
+            chosen_spec = spec
+            break
     return replace(
         step,
         choice=ActionChoice(action_code=action_code),
         legal_low_level_codes=encoded.legal_low_level_codes,
+        legal_low_level_specs=materialized_specs,
         legal_low_level_mask=encoded.legal_low_level_mask,
         legal_high_level_codes=encoded.legal_high_level_codes,
         high_to_low_map=encoded.high_to_low_map,
         chosen_high_level_code=int(chosen_high) if chosen_high is not None else None,
+        chosen_low_level_spec=chosen_spec,
     )
 
 

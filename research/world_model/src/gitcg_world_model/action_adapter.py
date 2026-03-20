@@ -124,6 +124,7 @@ def build_decision_context(
         step_index=step_index,
         full_state=full_state,
         legal_low_level_codes=encoded_actions.legal_low_level_codes,
+        legal_low_level_specs=tuple(materialized_specs),
         legal_low_level_mask=encoded_actions.legal_low_level_mask,
         legal_high_level_codes=encoded_actions.legal_high_level_codes,
         high_to_low_map=encoded_actions.high_to_low_map,

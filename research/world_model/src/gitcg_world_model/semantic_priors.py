@@ -27,3 +27,11 @@ def option_kind_priority_map(section_path: tuple[str, ...]) -> dict[OptionKind, 
 
 def action_quality_config() -> dict[str, Any]:
     return dict(load_semantic_priors()["action_quality"])
+
+
+def string_sequence(section_path: tuple[str, ...], *, field: str = "categories") -> tuple[str, ...]:
+    payload: Any = load_semantic_priors()
+    for key in section_path:
+        payload = payload[key]
+    values = payload[field]
+    return tuple(str(value) for value in values)

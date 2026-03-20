@@ -13,7 +13,10 @@ from .schema import (
     DecisionType,
     EntitySnapshot,
     EpisodeRecord,
+    LowLevelActionSpec,
+    OptionKind,
     PlayerSnapshot,
+    PublicSlotTarget,
     StateSnapshot,
     TrajectoryStep,
 )
@@ -156,6 +159,10 @@ def _deserialize_trajectory_step(payload: dict[str, Any]) -> TrajectoryStep:
         reward=float(payload["reward"]),
         done=bool(payload["done"]),
         legal_low_level_codes=tuple(int(value) for value in payload.get("legal_low_level_codes", ())),
+        legal_low_level_specs=tuple(
+            _deserialize_low_level_action_spec(value)
+            for value in payload.get("legal_low_level_specs", ())
+        ),
         legal_low_level_mask=tuple(bool(value) for value in payload.get("legal_low_level_mask", ())),
         legal_high_level_codes=tuple(int(value) for value in payload.get("legal_high_level_codes", ())),
         high_to_low_map=tuple(
@@ -170,6 +177,11 @@ def _deserialize_trajectory_step(payload: dict[str, Any]) -> TrajectoryStep:
             if payload.get("chosen_high_level_code") is not None
             else None
         ),
+        chosen_low_level_spec=(
+            _deserialize_low_level_action_spec(payload["chosen_low_level_spec"])
+            if payload.get("chosen_low_level_spec") is not None
+            else None
+        ),
         player_view=(
             _deserialize_state_snapshot(payload["player_view"])
             if payload.get("player_view") is not None
@@ -177,6 +189,38 @@ def _deserialize_trajectory_step(payload: dict[str, Any]) -> TrajectoryStep:
         ),
         full_state_json_before=payload.get("full_state_json_before"),
         metadata=dict(payload.get("metadata", {})),
+    )
+
+
+def _deserialize_low_level_action_spec(payload: dict[str, Any]) -> LowLevelActionSpec:
+    return LowLevelActionSpec(
+        action_code=int(payload.get("action_code", -1)),
+        request_type=DecisionType(payload["request_type"]),
+        kind=OptionKind(payload["kind"]),
+        label=str(payload["label"]),
+        subject_definition_id=int(payload.get("subject_definition_id", 0)),
+        target_slots=tuple(
+            _deserialize_public_slot_target(value)
+            for value in payload.get("target_slots", ())
+        ),
+        used_dice=tuple(int(value) for value in payload.get("used_dice", ())),
+        auto_selected_dice=tuple(int(value) for value in payload.get("auto_selected_dice", ())),
+        choose_active_slot=int(payload.get("choose_active_slot", -1)),
+        select_card_definition_id=int(payload.get("select_card_definition_id", 0)),
+        switch_hand_slot_mask=int(payload.get("switch_hand_slot_mask", 0)),
+        reroll_dice_mask=int(payload.get("reroll_dice_mask", 0)),
+        discarded_hand_slot=int(payload.get("discarded_hand_slot", -1)),
+        discarded_card_definition_id=int(payload.get("discarded_card_definition_id", 0)),
+        target_dice=int(payload.get("target_dice", 0)),
+        metadata=dict(payload.get("metadata", {})),
+    )
+
+
+def _deserialize_public_slot_target(payload: dict[str, Any]) -> PublicSlotTarget:
+    return PublicSlotTarget(
+        owner=str(payload["owner"]),
+        zone=str(payload["zone"]),
+        index=int(payload["index"]),
     )
 
 def _deserialize_state_snapshot(payload: dict[str, Any]) -> StateSnapshot:

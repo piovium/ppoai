@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -56,6 +57,51 @@ class PpoPipelineTests(unittest.TestCase):
 
         self.assertEqual(runner.call_count, 3)
         self.assertEqual(tuple(item["seed"] for item in episodes), (0, 1, 2))
+
+    def test_execute_episode_jobs_resumes_existing_output_without_rerunning_completed_jobs(self):
+        config = EnvConfig(deck_pool=SMALL_DECK_POOL)
+        jobs = tuple(
+            _EpisodeJob(
+                job_index=index,
+                matchup=SMALL_DECK_MATCHUPS[0],
+                seed=index,
+                agent0_factory=lambda _seed: _TaggedAgent(object(), trainable=True, tag="a"),
+                agent1_factory=lambda _seed: _TaggedAgent(object(), trainable=False, tag="b"),
+                metadata={},
+            )
+            for index in range(3)
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "episodes.jsonl"
+            output_path.write_text("", encoding="utf-8")
+            existing_episode = SimpleNamespace(matchup=SMALL_DECK_MATCHUPS[0].key, seed=0)
+
+            def fake_result(job):
+                return type(
+                    "Result",
+                    (),
+                    {"job": job, "episode": SimpleNamespace(matchup=job.matchup.key, seed=job.seed)},
+                )()
+
+            with (
+                patch("gitcg_world_model.ppo_pipeline.load_episode_records", return_value=[existing_episode]),
+                patch("gitcg_world_model.ppo_pipeline.append_episode_records") as append_mock,
+                patch(
+                    "gitcg_world_model.ppo_pipeline._run_episode_job",
+                    side_effect=lambda **kwargs: fake_result(kwargs["job"]),
+                ) as runner,
+            ):
+                episodes = _execute_episode_jobs(
+                    config=config,
+                    jobs=jobs,
+                    max_decisions=4,
+                    workers=1,
+                    output_path=output_path,
+                )
+
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(tuple(item.seed for item in episodes), (0, 1, 2))
+        append_mock.assert_called()
 
     def test_safe_candidate_epochs_filter_by_kl(self):
         payload = {
@@ -171,7 +217,7 @@ class PpoPipelineTests(unittest.TestCase):
                 },
                 checkpoint_path,
             )
-            self.assertEqual(_recommended_rollout_workers(8, checkpoint_path), 4)
+            self.assertEqual(_recommended_rollout_workers(8, checkpoint_path), 8)
             self.assertEqual(_recommended_rollout_workers(2, checkpoint_path), 2)
 
     def test_managed_loop_smoke_round_uses_p2sro_outputs(self):

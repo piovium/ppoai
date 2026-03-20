@@ -6,9 +6,11 @@ from typing import Any
 
 from .action_hierarchy import (
     public_spent_dice_for_code,
+    public_spent_dice_for_spec,
     selected_low_level_code,
     selected_low_level_spec,
     semantic_action_key_for_code,
+    semantic_action_key_for_spec,
 )
 from .schema import (
     CharacterSnapshot,
@@ -124,9 +126,17 @@ class PublicStateTracker:
             round_number=round_number,
             phase=phase,
             payload=payload,
-            semantic_key=(semantic_action_key_for_code(action_code) if action_code is not None else None),
+            semantic_key=(
+                semantic_action_key_for_spec(selected_spec)
+                if selected_spec is not None
+                else (semantic_action_key_for_code(action_code) if action_code is not None else None)
+            ),
             option_kind=(selected_spec.kind.value if selected_spec is not None else None),
-            used_dice_count=(public_spent_dice_for_code(action_code) if action_code is not None else 0),
+            used_dice_count=(
+                public_spent_dice_for_spec(selected_spec)
+                if selected_spec is not None
+                else (public_spent_dice_for_code(action_code) if action_code is not None else 0)
+            ),
             known_payload=known_payload,
             selected_legal_index=selected_legal_index,
             legal_option_count=len(step.legal_low_level_codes),
@@ -242,4 +252,3 @@ def mask_state_for_player(state: StateSnapshot, *, perspective_player: int) -> S
         winner=state.winner,
         players=(players[0], players[1]),
     )
-

@@ -25,6 +25,21 @@ REROLL_DICE = 6
 SWITCH_HANDS = 7
 ACTION_DECLARE_END = 8
 
+[agents.bootstrap.reroll_high_priority]
+categories = [
+  "keep_active_and_two_backline",
+  "keep_active_and_one_backline",
+  "keep_active_only",
+  "keep_two_backline",
+  "keep_one_backline",
+  "reroll_active_and_two_backline",
+  "reroll_active_and_one_backline",
+  "reroll_active_only",
+  "reroll_two_backline",
+  "reroll_one_backline",
+  "keep_all",
+]
+
 [action_quality]
 productive_non_end_kinds = ["ACTION_USE_SKILL", "ACTION_PLAY_CARD"]
 direct_productive_severity = 1.0

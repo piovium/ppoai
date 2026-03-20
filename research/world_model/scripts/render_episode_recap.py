@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any
 
 from gitcg_world_model.action_hierarchy import low_level_spec_for_code
+from gitcg_world_model.env import GitcgDecisionEnv
+from gitcg_world_model.schema import (
+    DecisionType,
+    EnvConfig,
+    LowLevelActionSpec,
+    Matchup,
+    OptionKind,
+    PublicSlotTarget,
+)
 
 
 ACTION_KIND_TEXT = {
@@ -70,6 +80,7 @@ def _load_definition_names() -> dict[int, str]:
 
 
 DEFINITION_NAMES = _load_definition_names()
+_RECONSTRUCTED_SPEC_CACHE: dict[tuple[str, str, int], LowLevelActionSpec | None] = {}
 
 
 def _name_for_definition(definition_id: int | None) -> str:
@@ -79,6 +90,12 @@ def _name_for_definition(definition_id: int | None) -> str:
 
 
 def _chosen_spec(step: dict[str, Any]):
+    stored = step.get("chosen_low_level_spec")
+    if isinstance(stored, dict):
+        return _deserialize_low_level_spec_payload(stored)
+    reconstructed = _reconstruct_chosen_spec(step)
+    if reconstructed is not None:
+        return reconstructed
     action_code = int(step.get("choice", {}).get("action_code", -1))
     if action_code < 0:
         return None
@@ -86,6 +103,83 @@ def _chosen_spec(step: dict[str, Any]):
         return low_level_spec_for_code(action_code)
     except KeyError:
         return None
+
+
+def _reconstruct_chosen_spec(step: dict[str, Any]) -> LowLevelActionSpec | None:
+    raw_state_json = step.get("full_state_json_before")
+    if not isinstance(raw_state_json, str) or not raw_state_json:
+        return None
+    metadata = dict(step.get("metadata", {}) or {})
+    chosen_action_index = metadata.get("chosen_action_index")
+    if chosen_action_index is None:
+        return None
+    matchup_key = str(metadata.get("matchup", ""))
+    if "__vs__" not in matchup_key:
+        return None
+    digest = hashlib.blake2b(raw_state_json.encode("utf-8"), digest_size=16).hexdigest()
+    cache_key = (digest, matchup_key, int(chosen_action_index))
+    if cache_key in _RECONSTRUCTED_SPEC_CACHE:
+        return _RECONSTRUCTED_SPEC_CACHE[cache_key]
+    deck0, deck1 = matchup_key.split("__vs__", maxsplit=1)
+    env = GitcgDecisionEnv(
+        EnvConfig(
+            deck_pool=(),
+            record_full_state_json=False,
+            record_player_view=True,
+            draw_penalty=0.0,
+        ),
+        Matchup(deck0, deck1),
+        enable_result_based_action_relabel=False,
+    )
+    spec: LowLevelActionSpec | None = None
+    try:
+        context = env.reset(state_json=raw_state_json)
+        index = int(chosen_action_index)
+        if 0 <= index < len(context.legal_low_level_specs):
+            spec = context.legal_low_level_specs[index]
+    except Exception:
+        spec = None
+    finally:
+        env.close()
+    _RECONSTRUCTED_SPEC_CACHE[cache_key] = spec
+    return spec
+
+
+def _deserialize_low_level_spec_payload(payload: dict[str, Any]) -> LowLevelActionSpec:
+    return LowLevelActionSpec(
+        action_code=int(payload.get("action_code", -1)),
+        request_type=DecisionType(payload["request_type"]),
+        kind=OptionKind(payload["kind"]),
+        label=str(payload["label"]),
+        subject_definition_id=int(payload.get("subject_definition_id", 0)),
+        target_slots=tuple(
+            PublicSlotTarget(
+                owner=str(value["owner"]),
+                zone=str(value["zone"]),
+                index=int(value["index"]),
+            )
+            for value in payload.get("target_slots", ())
+        ),
+        used_dice=tuple(int(value) for value in payload.get("used_dice", ())),
+        auto_selected_dice=tuple(int(value) for value in payload.get("auto_selected_dice", ())),
+        choose_active_slot=int(payload.get("choose_active_slot", -1)),
+        select_card_definition_id=int(payload.get("select_card_definition_id", 0)),
+        switch_hand_slot_mask=int(payload.get("switch_hand_slot_mask", 0)),
+        reroll_dice_mask=int(payload.get("reroll_dice_mask", 0)),
+        discarded_hand_slot=int(payload.get("discarded_hand_slot", -1)),
+        discarded_card_definition_id=int(payload.get("discarded_card_definition_id", 0)),
+        target_dice=int(payload.get("target_dice", 0)),
+        metadata=dict(payload.get("metadata", {})),
+    )
+
+
+def _kind_name(spec) -> str:
+    if spec is None:
+        return "unknown"
+    kind = getattr(spec, "kind", None)
+    if isinstance(kind, OptionKind):
+        return kind.value
+    return str(kind or "unknown")
 
 
 def _format_targets(metadata: dict[str, Any]) -> str:
@@ -176,14 +270,19 @@ def _entity_display_name(kind: str, definition_id: int, owner: int) -> str:
     return f"{prefix}{name}"
 
 
-def _format_target_names(before_root: dict[str, Any] | None, spec) -> str:
+def _format_target_names(before_root: dict[str, Any] | None, spec, *, actor: int) -> str:
     names: list[str] = []
     if before_root is not None and spec is not None:
         player_count = len(before_root.get("players", []))
         for target in getattr(spec, "target_slots", ()):
             if player_count < 2:
                 continue
-            owner_index = 0 if target.owner == "self" else 1
+            if target.owner == "self":
+                owner_index = actor
+            elif target.owner == "opponent":
+                owner_index = 1 - actor
+            else:
+                owner_index = 0
             player = before_root.get("players", [])[owner_index]
             zone = str(target.zone)
             index = int(target.index)
@@ -239,7 +338,7 @@ def _format_dice_pool(dice_values: list[Any] | None) -> str:
 def _format_extra(spec) -> str:
     if spec is None:
         return ""
-    kind = str(getattr(spec, "kind", ""))
+    kind = _kind_name(spec)
     parts: list[str] = []
     if kind == "action_elemental_tuning":
         removed = int(getattr(spec, "discarded_card_definition_id", 0))
@@ -470,7 +569,7 @@ def _actor_name(pre_state: dict[str, Any], acting_player: int) -> str:
 
 def _human_line(step: dict[str, Any], index: int) -> str:
     spec = _chosen_spec(step)
-    kind = str(getattr(spec, "kind", "unknown"))
+    kind = _kind_name(spec)
     action_text = ACTION_KIND_TEXT.get(kind, kind)
     actor = int(step.get("acting_player", -1))
     pre_state = dict(step.get("pre_state", {}) or {})
@@ -487,7 +586,7 @@ def _human_line(step: dict[str, Any], index: int) -> str:
     )
     round_number = int(pre_state.get("round_number", -1))
     definition = _format_definition(spec)
-    targets = _format_target_names(before_root, spec)
+    targets = _format_target_names(before_root, spec, actor=actor)
     dice = _format_dice(spec)
     extra = _format_extra(spec)
     actor_name = _actor_name(pre_state, actor)

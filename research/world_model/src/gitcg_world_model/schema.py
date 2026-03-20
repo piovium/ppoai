@@ -159,6 +159,7 @@ class DecisionContext:
     step_index: int
     full_state: StateSnapshot
     legal_low_level_codes: tuple[int, ...] = ()
+    legal_low_level_specs: tuple[LowLevelActionSpec, ...] = ()
     legal_low_level_mask: tuple[bool, ...] = ()
     legal_high_level_codes: tuple[int, ...] = ()
     high_to_low_map: tuple[tuple[int, tuple[int, ...]], ...] = ()
@@ -185,10 +186,12 @@ class TrajectoryStep:
     reward: float
     done: bool
     legal_low_level_codes: tuple[int, ...] = ()
+    legal_low_level_specs: tuple[LowLevelActionSpec, ...] = ()
     legal_low_level_mask: tuple[bool, ...] = ()
     legal_high_level_codes: tuple[int, ...] = ()
     high_to_low_map: tuple[tuple[int, tuple[int, ...]], ...] = ()
     chosen_high_level_code: int | None = None
+    chosen_low_level_spec: LowLevelActionSpec | None = None
     player_view: StateSnapshot | None = None
     full_state_json_before: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

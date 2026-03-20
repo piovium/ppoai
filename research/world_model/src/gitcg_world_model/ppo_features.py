@@ -9,7 +9,7 @@ from .action_hierarchy import (
     default_hierarchical_action_codebook,
     high_action_vocab_size,
     legal_high_to_low_dict,
-    low_level_spec_for_code,
+    legal_low_level_specs,
     selected_low_level_spec,
 )
 from .belief_groups import belief_group_dim, encode_group_presence
@@ -329,14 +329,15 @@ class TokenObservationEncoder:
         tokens = tokens[: self.max_tokens]
         opponent_token_mask = opponent_token_mask[: self.max_tokens]
         low_level_codes = tuple(int(code) for code in context.legal_low_level_codes)
+        low_level_specs = legal_low_level_specs(context)
         low_to_high = {
             int(code): int(high_code)
             for high_code, low_codes in context.high_to_low_map
             for code in low_codes
         }
         option_features = tuple(
-            self.event.encode_public_low_level_spec(low_level_spec_for_code(code), context)
-            for code in low_level_codes
+            self.event.encode_public_low_level_spec(spec, context)
+            for spec in low_level_specs
         )
         option_mask = tuple(bool(value) for value in context.legal_low_level_mask)
         high_mask = [False] * high_action_vocab_size()
@@ -536,12 +537,7 @@ class TokenObservationEncoder:
         return selected_low_level_spec(step)
 
     def _selected_low_spec(self, step: TrajectoryStep):
-        if step.choice.action_code >= 0:
-            try:
-                return low_level_spec_for_code(int(step.choice.action_code))
-            except KeyError:
-                pass
-        return None
+        return selected_low_level_spec(step)
 
     def _safe_ratio(self, value: float, denom: float) -> float:
         if denom <= 0:

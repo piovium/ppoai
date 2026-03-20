@@ -1648,6 +1648,7 @@ def _context_from_step(step: TrajectoryStep, *, episode_metadata: dict[str, obje
         step_index=0,
         full_state=step.pre_state,
         legal_low_level_codes=step.legal_low_level_codes,
+        legal_low_level_specs=step.legal_low_level_specs,
         legal_low_level_mask=step.legal_low_level_mask,
         legal_high_level_codes=step.legal_high_level_codes,
         high_to_low_map=step.high_to_low_map,

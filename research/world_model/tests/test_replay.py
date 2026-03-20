@@ -31,6 +31,12 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(loaded[0].steps[0].request_type, DecisionType.ACTION)
         self.assertEqual(loaded[0].steps[0].choice.action_code, episode.steps[0].choice.action_code)
         self.assertTrue(loaded[0].steps[0].legal_low_level_codes)
+        self.assertTrue(loaded[0].steps[0].legal_low_level_specs)
+        self.assertIsNotNone(loaded[0].steps[0].chosen_low_level_spec)
+        self.assertEqual(
+            loaded[0].steps[0].chosen_low_level_spec.kind,
+            episode.steps[0].chosen_low_level_spec.kind,
+        )
 
     def test_resolve_and_load_from_directory(self):
         episode = synthetic_episode_record()

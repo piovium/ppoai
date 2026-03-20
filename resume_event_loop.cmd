@@ -3,7 +3,7 @@ setlocal
 
 set "REPO_ROOT=%~dp0"
 if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
-set "WORKSPACE=D:\WorldModelTemp\ppo_oracle_search_psro_live"
+set "WORKSPACE=D:\WorldModelTemp\ppo_oracle_search_psro_live_stable_actions_rerollfix"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$repoRoot = [System.IO.Path]::GetFullPath('%REPO_ROOT%');" ^
@@ -44,7 +44,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "    '--micro-batch-size', '8'," ^
   "    '--epochs', '12'," ^
   "    '--bootstrap-epochs', '5'," ^
-  "    '--learning-rate', '0.001'," ^
+  "    '--learning-rate', '0.0003'," ^
   "    '--weight-decay', '0.0001'," ^
   "    '--grad-clip-norm', '1.0'," ^
   "    '--gamma', '0.99'," ^
@@ -54,12 +54,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "    '--value-coef', '0.5'," ^
   "    '--belief-coef', '0.2'," ^
   "    '--oracle-coef', '0.2'," ^
-  "    '--reference-kl-coef', '0.005'," ^
+  "    '--reference-kl-coef', '0.007'," ^
   "    '--target-kl-low', '0.01'," ^
   "    '--target-kl-high', '0.05'," ^
   "    '--use-amp'," ^
   "    '--device', 'cuda'," ^
-  "    '--workers', '12'," ^
+  "    '--workers', '6'," ^
   "    '--inference-max-batch-size', '192'," ^
   "    '--inference-max-wait-ms', '4'," ^
   "    '--retain-round-directories', '6'," ^

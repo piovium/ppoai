@@ -178,6 +178,15 @@ class GitcgDecisionEnv:
         )
         terminal_context = replace(next_context, reward=reward)
         normalized_choice = ActionChoice(action_code=chosen_action_code)
+        chosen_low_level_spec = None
+        for candidate_code, candidate_spec in zip(
+            self._current_context.legal_low_level_codes,
+            self._current_context.legal_low_level_specs,
+            strict=False,
+        ):
+            if int(candidate_code) == chosen_action_code:
+                chosen_low_level_spec = candidate_spec
+                break
         trajectory_step = TrajectoryStep(
             acting_player=self._current_context.acting_player,
             request_type=self._current_context.request_type,
@@ -187,6 +196,7 @@ class GitcgDecisionEnv:
             reward=reward,
             done=done,
             legal_low_level_codes=self._current_context.legal_low_level_codes,
+            legal_low_level_specs=self._current_context.legal_low_level_specs,
             legal_low_level_mask=self._current_context.legal_low_level_mask,
             legal_high_level_codes=self._current_context.legal_high_level_codes,
             high_to_low_map=self._current_context.high_to_low_map,
@@ -195,6 +205,7 @@ class GitcgDecisionEnv:
                 if self._current_built_context is not None
                 else None
             ),
+            chosen_low_level_spec=chosen_low_level_spec,
             player_view=self._current_context.player_view,
             full_state_json_before=self._current_context.full_state_json,
             metadata={
