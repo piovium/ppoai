@@ -1,0 +1,447 @@
+diff --git a/research/world_model/src/gitcg_world_model/action_adapter.py b/research/world_model/src/gitcg_world_model/action_adapter.py
+--- a/research/world_model/src/gitcg_world_model/action_adapter.py
++++ b/research/world_model/src/gitcg_world_model/action_adapter.py
+@@ -57,7 +57,7 @@ def build_decision_context(
+     full_state_json: str | None,
+     step_index: int,
+     metadata: dict[str, Any] | None = None,
+-    enable_result_based_action_relabel: bool = True,
++    enable_result_based_action_relabel: bool = False,
+ ) -> BuiltDecisionContext:
+     metadata = metadata or {}
+     builder = {
+@@ -82,6 +82,9 @@ def build_decision_context(
+     if (
+         enable_result_based_action_relabel
+         and request_type == DecisionType.ACTION
++        # Online acting/search stays on the pre-state intent taxonomy. Outcome-
++        # based relabel is an offline analysis/training tool and must not sit on
++        # the hot path.
+         and full_state_json
+         and encoded_actions.legal_low_level_codes
+     ):
+diff --git a/research/world_model/src/gitcg_world_model/action_hierarchy.py b/research/world_model/src/gitcg_world_model/action_hierarchy.py
+--- a/research/world_model/src/gitcg_world_model/action_hierarchy.py
++++ b/research/world_model/src/gitcg_world_model/action_hierarchy.py
+@@ -282,6 +282,13 @@ def low_level_semantic_key_for_code(action_code: int) -> tuple[Any, ...]:
+ def low_level_spec_for_code(action_code: int) -> LowLevelActionSpec:
+     return default_hierarchical_action_codebook().low_spec(action_code)
+ 
++
++def try_low_level_spec_for_code(action_code: int) -> LowLevelActionSpec | None:
++    try:
++        return low_level_spec_for_code(int(action_code))
++    except KeyError:
++        return None
++
+ 
+ def high_level_spec_for_code(high_action_code: int) -> HighLevelActionSpec:
+     return default_hierarchical_action_codebook().high_spec(high_action_code)
+@@ -292,7 +299,12 @@ def high_action_vocab_size() -> int:
+ def legal_low_level_specs(context: DecisionContext) -> tuple[LowLevelActionSpec, ...]:
+     if context.legal_low_level_specs:
+         return tuple(context.legal_low_level_specs)
+-    return tuple(low_level_spec_for_code(int(code)) for code in context.legal_low_level_codes)
++    recovered: list[LowLevelActionSpec] = []
++    for code in context.legal_low_level_codes:
++        spec = try_low_level_spec_for_code(int(code))
++        if spec is not None:
++            recovered.append(spec)
++    return tuple(recovered)
+ 
+ 
+ def selected_low_level_code(step) -> int | None:
+@@ -337,7 +349,19 @@ def selected_high_level_code(step) -> int | None:
+ def low_level_kind_for_code(action_code: int) -> OptionKind:
+     return low_level_spec_for_code(int(action_code)).kind
+ 
++
++def try_low_level_kind_for_code(action_code: int) -> OptionKind | None:
++    spec = try_low_level_spec_for_code(int(action_code))
++    return spec.kind if spec is not None else None
++
+ 
+ def semantic_action_key_for_code(action_code: int) -> tuple[Any, ...]:
+     spec = low_level_spec_for_code(int(action_code))
+     return semantic_action_key_for_spec(spec)
++
++
++def try_semantic_action_key_for_code(action_code: int) -> tuple[Any, ...] | None:
++    spec = try_low_level_spec_for_code(int(action_code))
++    if spec is None:
++        return None
++    return semantic_action_key_for_spec(spec)
+@@ -373,6 +399,13 @@ def public_spent_dice_for_code(action_code: int) -> int:
+     spec = low_level_spec_for_code(int(action_code))
+     return public_spent_dice_for_spec(spec)
+ 
++
++def try_public_spent_dice_for_code(action_code: int) -> int | None:
++    spec = try_low_level_spec_for_code(int(action_code))
++    if spec is None:
++        return None
++    return public_spent_dice_for_spec(spec)
++
+ 
+ def public_spent_dice_for_spec(spec: LowLevelActionSpec) -> int:
+     if spec.kind == OptionKind.ACTION_ELEMENTAL_TUNING:
+diff --git a/research/world_model/src/gitcg_world_model/public_state.py b/research/world_model/src/gitcg_world_model/public_state.py
+--- a/research/world_model/src/gitcg_world_model/public_state.py
++++ b/research/world_model/src/gitcg_world_model/public_state.py
+@@ -9,9 +9,11 @@ from .action_hierarchy import (
+     public_spent_dice_for_code,
+     public_spent_dice_for_spec,
+     selected_low_level_code,
+     selected_low_level_spec,
+     semantic_action_key_for_code,
+     semantic_action_key_for_spec,
++    try_public_spent_dice_for_code,
++    try_semantic_action_key_for_code,
+ )
+ from .schema import (
+     CharacterSnapshot,
+@@ -123,17 +125,15 @@ class PublicStateTracker:
+             round_number=round_number,
+             phase=phase,
+             payload=payload,
+-            semantic_key=(
+-                semantic_action_key_for_spec(selected_spec)
+-                if selected_spec is not None
+-                else (semantic_action_key_for_code(action_code) if action_code is not None else None)
+-            ),
++            semantic_key=_semantic_key_for_step(
++                selected_spec=selected_spec,
++                action_code=action_code,
++            ),
+             option_kind=(selected_spec.kind.value if selected_spec is not None else None),
+-            used_dice_count=(
+-                public_spent_dice_for_spec(selected_spec)
+-                if selected_spec is not None
+-                else (public_spent_dice_for_code(action_code) if action_code is not None else 0)
+-            ),
++            used_dice_count=_public_spent_dice_for_step(
++                selected_spec=selected_spec,
++                action_code=action_code,
++            ),
+             known_payload=known_payload,
+             selected_legal_index=selected_legal_index,
+             legal_option_count=len(step.legal_low_level_codes),
+@@ -172,6 +180,28 @@ class PublicStateTracker:
+         for record in history:
+             tracker.observe_public_record(record)
+         return tracker
++
++
++def _semantic_key_for_step(*, selected_spec, action_code: int | None):
++    if selected_spec is not None:
++        return semantic_action_key_for_spec(selected_spec)
++    if action_code is None:
++        return None
++    key = try_semantic_action_key_for_code(int(action_code))
++    if key is not None:
++        return key
++    return (("request_type", "unknown"), ("kind", "unknown"), ("action_code", int(action_code)))
++
++
++def _public_spent_dice_for_step(*, selected_spec, action_code: int | None) -> int:
++    if selected_spec is not None:
++        return public_spent_dice_for_spec(selected_spec)
++    if action_code is None:
++        return 0
++    spent = try_public_spent_dice_for_code(int(action_code))
++    if spent is not None:
++        return spent
++    return 0
+ 
+ 
+ def mask_state_for_player(state: StateSnapshot, *, perspective_player: int) -> StateSnapshot:
+diff --git a/research/world_model/src/gitcg_world_model/sepot_search.py b/research/world_model/src/gitcg_world_model/sepot_search.py
+--- a/research/world_model/src/gitcg_world_model/sepot_search.py
++++ b/research/world_model/src/gitcg_world_model/sepot_search.py
+@@ -10,9 +10,14 @@ import torch
+ 
+ from .action_hierarchy import (
++    legal_low_level_specs,
+     low_level_kind_for_code,
+     match_low_level_code_index,
+     public_spent_dice_for_code,
++    public_spent_dice_for_spec,
+     semantic_action_key_for_code,
++    semantic_action_key_for_spec,
++    try_low_level_kind_for_code,
++    try_semantic_action_key_for_code,
+ )
+ from .decks import deck_by_name
+ from .env import GitcgDecisionEnv
+@@ -80,18 +84,9 @@ def should_trigger_search(
+         return False
+     legal_count = len(context.legal_low_level_codes)
+     round_number = int(context.player_view.round_number)
+-    has_end = any(
+-        low_level_kind_for_code(int(action_code)) == OptionKind.ACTION_DECLARE_END
+-        for action_code in context.legal_low_level_codes
+-    )
+-    productive_non_end = any(
+-        low_level_kind_for_code(int(action_code)) in {
+-            OptionKind.ACTION_USE_SKILL,
+-            OptionKind.ACTION_PLAY_CARD,
+-            OptionKind.ACTION_ELEMENTAL_TUNING,
+-        }
+-        for action_code in context.legal_low_level_codes
+-    )
++    legal_kinds = _legal_option_kinds(context)
++    has_end = OptionKind.ACTION_DECLARE_END in legal_kinds
++    productive_non_end = any(kind in _PRODUCTIVE_ACTION_KINDS for kind in legal_kinds)
+     if round_number <= 3:
+         return legal_count >= 6 or (has_end and productive_non_end)
+     return round_number >= 4 and legal_count >= 2
+@@ -216,20 +212,10 @@ def step_search_context_summary(context: DecisionContext) -> tuple[float, ...]:
+     visible_state = context.player_view
+     round_number = float(getattr(visible_state, "round_number", 0))
+     phase = str(getattr(visible_state, "phase", ""))
++    legal_kinds = _legal_option_kinds(context)
+     legal_count = float(len(context.legal_low_level_codes))
+-    has_end = any(
+-        low_level_kind_for_code(int(action_code)) == OptionKind.ACTION_DECLARE_END
+-        for action_code in context.legal_low_level_codes
+-    )
+-    productive = sum(
+-        1
+-        for action_code in context.legal_low_level_codes
+-        if low_level_kind_for_code(int(action_code)) in {
+-            OptionKind.ACTION_USE_SKILL,
+-            OptionKind.ACTION_PLAY_CARD,
+-            OptionKind.ACTION_ELEMENTAL_TUNING,
+-        }
+-    )
++    has_end = OptionKind.ACTION_DECLARE_END in legal_kinds
++    productive = sum(1 for kind in legal_kinds if kind in _PRODUCTIVE_ACTION_KINDS)
+     return (
+         min(round_number, 20.0) / 20.0,
+         min(legal_count, 16.0) / 16.0,
+@@ -253,6 +244,37 @@ def state_search_context_summary(
+         0.0,
+     )
+ 
++
++_PRODUCTIVE_ACTION_KINDS = {
++    OptionKind.ACTION_USE_SKILL,
++    OptionKind.ACTION_PLAY_CARD,
++    OptionKind.ACTION_ELEMENTAL_TUNING,
++}
++
++
++def _legal_option_kinds(context: DecisionContext) -> tuple[OptionKind, ...]:
++    specs = legal_low_level_specs(context)
++    if specs:
++        return tuple(spec.kind for spec in specs)
++    kinds: list[OptionKind] = []
++    for action_code in context.legal_low_level_codes:
++        kind = try_low_level_kind_for_code(int(action_code))
++        if kind is not None:
++            kinds.append(kind)
++    return tuple(kinds)
++
++
++def _legal_semantic_options(context: DecisionContext) -> tuple[tuple[Any, ...], ...]:
++    specs = legal_low_level_specs(context)
++    if specs:
++        return tuple(semantic_action_key_for_spec(spec) for spec in specs)
++    options: list[tuple[Any, ...]] = []
++    for action_code in context.legal_low_level_codes:
++        key = try_semantic_action_key_for_code(int(action_code))
++        if key is not None:
++            options.append(key)
++    return tuple(options)
++
+ 
+ class _RawStoreBuilder:
+     def __init__(self, store: list[Any]) -> None:
+@@ -416,28 +429,36 @@ class PublicBeliefUpdater:
+         sampled_self_hypothesis: ExplicitRangeHypothesis,
+         sampled_opponent_hypothesis: ExplicitRangeHypothesis,
+         deadline: float,
+     ) -> _RangeUpdateResult:
+         if time.perf_counter() > deadline:
+             raise _SearchTimeout()
++        public_state = mask_state_for_player(post_state, perspective_player=pre_public_belief.root_player)
+         cache_key = (
+             _public_belief_cache_key(pre_public_belief),
+             semantic_action_key_for_code(selected_action_code),
+             _hypothesis_cache_key(sampled_self_hypothesis),
++            _hypothesis_cache_key(sampled_opponent_hypothesis),
+         )
+         updated_opponent_range = self._advance_cache.get(cache_key)
+         if updated_opponent_range is None:
+-            updated_opponent_range = self._advance_opponent_range(
+-                pre_public_belief=pre_public_belief,
+-                selected_action_code=selected_action_code,
+-                sampled_self_hypothesis=sampled_self_hypothesis,
+-                sampled_opponent_hypothesis=sampled_opponent_hypothesis,
+-                deadline=deadline,
+-            )
++            if self._can_keep_sampled_opponent(
++                pre_public_belief=pre_public_belief,
++                post_public_state=public_state,
++                tracker=tracker,
++            ):
++                updated_opponent_range = ExplicitRange((replace_weight(sampled_opponent_hypothesis, 1.0),))
++            else:
++                updated_opponent_range = self._advance_opponent_range(
++                    pre_public_belief=pre_public_belief,
++                    selected_action_code=selected_action_code,
++                    sampled_self_hypothesis=sampled_self_hypothesis,
++                    sampled_opponent_hypothesis=sampled_opponent_hypothesis,
++                    deadline=deadline,
++                )
+             if updated_opponent_range.count > 0:
+                 self._advance_cache[cache_key] = updated_opponent_range
+                 if len(self._advance_cache) > 256:
+                     self._advance_cache.clear()
+-        public_state = mask_state_for_player(post_state, perspective_player=pre_public_belief.root_player)
+         updated = PublicBeliefState(
+             root_player=pre_public_belief.root_player,
+             acting_player=(
+@@ -437,5 +453,21 @@ class PublicBeliefUpdater:
+             sampled_opponent_hypothesis=sampled_opponent_hypothesis,
+         )
++
++    def _can_keep_sampled_opponent(
++        self,
++        *,
++        pre_public_belief: PublicBeliefState,
++        post_public_state: StateSnapshot,
++        tracker: PublicStateTracker,
++    ) -> bool:
++        next_public_hand = tracker.opponent_public_hand_count_from_state(post_public_state)
++        next_public_dice = tracker.opponent_public_dice_count_from_state(post_public_state)
++        next_revealed = tracker.revealed_opponent_card_definition_ids()
++        return (
++            abs(float(next_public_hand) - float(pre_public_belief.opponent_public_hand_count)) <= 1.0e-6
++            and abs(float(next_public_dice) - float(pre_public_belief.opponent_public_dice_count)) <= 1.0e-6
++            and tuple(int(value) for value in next_revealed) == tuple(int(value) for value in pre_public_belief.revealed_opponent_card_definition_ids)
++        )
+ 
+     def _advance_opponent_range(
+         self,
+@@ -986,58 +1016,17 @@ class SePotSearchController:
+                 current_tracker=tracker,
+                 policy_cache=policy_cache,
+                 leaf_value_cache=leaf_value_cache,
+             )
+-        log_probs = _policy_log_probs(
+-            context=current_context,
+-            history=current_history,
+-            public_history=current_public_belief.public_history,
+-            opponent_deck_name=opponent_deck_name,
+-            model=model,
+-            encoder=encoder,
+-            device=device,
+-            cache=policy_cache,
+-        )
+-        ranked = sorted(range(len(log_probs)), key=lambda index: float(log_probs[index]), reverse=True)
+-        candidate_indices = tuple(ranked[: max(1, min(len(ranked), budget.root_top_k))])
+-        branch_scores: list[float] = []
+-        for candidate_index in candidate_indices:
+-            if time.perf_counter() > deadline:
+-                break
+-            try:
+-                branch_value = self._evaluate_internal_self_candidate(
+-                    current_context=current_context,
+-                    current_sampled_state_json=current_sampled_state_json,
+-                    current_public_belief=current_public_belief,
+-                    current_history=current_history,
+-                    root_player=root_player,
+-                    budget=budget,
+-                    depth_remaining=depth_remaining,
+-                    model=model,
+-                    encoder=encoder,
+-                    device=device,
+-                    opponent_deck_name=opponent_deck_name,
+-                    search_state_value_fn=search_state_value_fn,
+-                    deadline=deadline,
+-                    updater=updater,
+-                    selected_action_code=int(current_context.legal_low_level_codes[candidate_index]),
+-                    env_config=getattr(env, "_config", None),
+-                    matchup=getattr(env, "_matchup", None),
+-                    current_tracker=current_tracker,
+-                    policy_cache=policy_cache,
+-                    leaf_value_cache=leaf_value_cache,
+-                )
+-            except _SearchTimeout:
+-                break
+-            if branch_value is not None:
+-                branch_scores.append(float(branch_value))
+-        if not branch_scores:
+-            return _leaf_value(
+-                public_belief=current_public_belief,
+-                current_context=current_context,
+-                budget=budget,
+-                card_vocabulary=self.card_vocabulary,
+-                device=device,
+-                search_state_value_fn=search_state_value_fn,
+-                cache=leaf_value_cache,
+-            )
+-        return max(branch_scores)
++        # Root-heavy selective planning: the root action is the only place where we
++        # branch aggressively. Once control returns to the root player, collapse the
++        # remainder of the rollout to a cached leaf estimate instead of spawning a
++        # new self-branch tree.
++        return _leaf_value(
++            public_belief=current_public_belief,
++            current_context=current_context,
++            budget=budget,
++            card_vocabulary=self.card_vocabulary,
++            device=device,
++            search_state_value_fn=search_state_value_fn,
++            cache=leaf_value_cache,
++        )
+@@ -1160,16 +1167,12 @@ def _context_policy_cache_key(
+     player_view = context.player_view
+     round_number = int(getattr(player_view, "round_number", 0)) if player_view is not None else 0
+     phase = str(getattr(player_view, "phase", "")) if player_view is not None else ""
+-    semantic_options = tuple(
+-        semantic_action_key_for_code(int(action_code))
+-        for action_code in context.legal_low_level_codes
+-    )
+     return (
+         int(context.acting_player),
+         str(context.request_type.value),
+         round_number,
+         phase,
+         len(public_history),
+         str(opponent_deck_name),
+-        semantic_options,
++        _legal_semantic_options(context),
+     )
+@@ -1214,27 +1217,12 @@ def _belief_context_summary(
+     *,
+     public_belief: PublicBeliefState,
+     current_context: DecisionContext | None,
+     budget: SePotPhaseBudget,
+ ) -> tuple[float, ...]:
++    legal_kinds = _legal_option_kinds(current_context) if current_context is not None else ()
+     legal_count = float(len(current_context.legal_low_level_codes)) if current_context is not None else 0.0
+-    has_end = bool(
+-        current_context is not None
+-        and any(
+-            low_level_kind_for_code(int(action_code)) == OptionKind.ACTION_DECLARE_END
+-            for action_code in current_context.legal_low_level_codes
+-        )
+-    )
+-    productive = float(
+-        sum(
+-            1
+-            for action_code in (current_context.legal_low_level_codes if current_context is not None else ())
+-            if low_level_kind_for_code(int(action_code)) in {
+-                OptionKind.ACTION_USE_SKILL,
+-                OptionKind.ACTION_PLAY_CARD,
+-                OptionKind.ACTION_ELEMENTAL_TUNING,
+-            }
+-        )
+-    )
++    has_end = OptionKind.ACTION_DECLARE_END in legal_kinds
++    productive = float(sum(1 for kind in legal_kinds if kind in _PRODUCTIVE_ACTION_KINDS))
+     return (
+         min(float(public_belief.round_number), 20.0) / 20.0,
+         min(legal_count, 16.0) / 16.0,

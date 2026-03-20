@@ -1,0 +1,18 @@
+diff --git a/research/world_model/src/gitcg_world_model/sepot_search.py b/research/world_model/src/gitcg_world_model/sepot_search.py
+index 71b7a6c..c4ee88d 100644
+--- a/research/world_model/src/gitcg_world_model/sepot_search.py
++++ b/research/world_model/src/gitcg_world_model/sepot_search.py
+@@ -954,11 +954,20 @@ def _env_config_from_matchup(matchup: Matchup) -> EnvConfig | None:
+     except KeyError:
+         return None
+     deck_pool = (deck0,) if deck0.name == deck1.name else (deck0, deck1)
+-    return EnvConfig(deck_pool=deck_pool)
++    # Runtime SePoT reconstructs sampled search branches from full-state JSON.
++    # Without recorded full_state_json / player_view on the internal env, the
++    # reconstructor often cannot synthesize an ACTION template and the runtime
++    # controller falls back on every state (fall-rate ~= 1.0).
++    return EnvConfig(
++        deck_pool=deck_pool,
++        record_full_state_json=True,
++        record_player_view=True,
++    )

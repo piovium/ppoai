@@ -11,6 +11,8 @@ from .action_hierarchy import (
     selected_low_level_spec,
     semantic_action_key_for_code,
     semantic_action_key_for_spec,
+    try_public_spent_dice_for_code,
+    try_semantic_action_key_for_code,
 )
 from .schema import (
     CharacterSnapshot,
@@ -120,23 +122,28 @@ class PublicStateTracker:
                 known_payload = True
         round_number = int(step.player_view.round_number) if step.player_view is not None else 0
         phase = str(step.player_view.phase) if step.player_view is not None else ""
+        semantic_key = None
+        option_kind = selected_spec.kind.value if selected_spec is not None else None
+        used_dice_count = 0
+        if selected_spec is not None:
+            semantic_key = semantic_action_key_for_spec(selected_spec)
+            used_dice_count = public_spent_dice_for_spec(selected_spec)
+        elif action_code is not None:
+            try:
+                semantic_key = semantic_action_key_for_code(action_code)
+                used_dice_count = public_spent_dice_for_code(action_code)
+            except KeyError:
+                semantic_key = None
+                used_dice_count = 0
         record = PublicActionRecord(
             acting_player=int(step.acting_player),
             request_type=step.request_type,
             round_number=round_number,
             phase=phase,
             payload=payload,
-            semantic_key=(
-                semantic_action_key_for_spec(selected_spec)
-                if selected_spec is not None
-                else (semantic_action_key_for_code(action_code) if action_code is not None else None)
-            ),
-            option_kind=(selected_spec.kind.value if selected_spec is not None else None),
-            used_dice_count=(
-                public_spent_dice_for_spec(selected_spec)
-                if selected_spec is not None
-                else (public_spent_dice_for_code(action_code) if action_code is not None else 0)
-            ),
+            semantic_key=semantic_key,
+            option_kind=option_kind,
+            used_dice_count=used_dice_count,
             known_payload=known_payload,
             selected_legal_index=selected_legal_index,
             legal_option_count=len(step.legal_low_level_codes),
@@ -200,6 +207,28 @@ class PublicStateTracker:
         for record in history:
             tracker.observe_public_record(record)
         return tracker
+
+
+def _semantic_key_for_step(*, selected_spec, action_code: int | None):
+    if selected_spec is not None:
+        return semantic_action_key_for_spec(selected_spec)
+    if action_code is None:
+        return None
+    key = try_semantic_action_key_for_code(int(action_code))
+    if key is not None:
+        return key
+    return (("request_type", "unknown"), ("kind", "unknown"), ("action_code", int(action_code)))
+
+
+def _public_spent_dice_for_step(*, selected_spec, action_code: int | None) -> int:
+    if selected_spec is not None:
+        return public_spent_dice_for_spec(selected_spec)
+    if action_code is None:
+        return 0
+    spent = try_public_spent_dice_for_code(int(action_code))
+    if spent is not None:
+        return spent
+    return 0
 
 
 def mask_state_for_player(state: StateSnapshot, *, perspective_player: int) -> StateSnapshot:

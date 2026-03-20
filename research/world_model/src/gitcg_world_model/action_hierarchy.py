@@ -285,6 +285,13 @@ def low_level_spec_for_code(action_code: int) -> LowLevelActionSpec:
     return default_hierarchical_action_codebook().low_spec(action_code)
 
 
+def try_low_level_spec_for_code(action_code: int) -> LowLevelActionSpec | None:
+    try:
+        return low_level_spec_for_code(int(action_code))
+    except KeyError:
+        return None
+
+
 def high_level_spec_for_code(high_action_code: int) -> HighLevelActionSpec:
     return default_hierarchical_action_codebook().high_spec(high_action_code)
 
@@ -295,7 +302,12 @@ def high_action_vocab_size() -> int:
 def legal_low_level_specs(context: DecisionContext) -> tuple[LowLevelActionSpec, ...]:
     if context.legal_low_level_specs:
         return tuple(context.legal_low_level_specs)
-    return tuple(low_level_spec_for_code(int(code)) for code in context.legal_low_level_codes)
+    recovered: list[LowLevelActionSpec] = []
+    for code in context.legal_low_level_codes:
+        spec = try_low_level_spec_for_code(int(code))
+        if spec is not None:
+            recovered.append(spec)
+    return tuple(recovered)
 
 
 def selected_low_level_code(step) -> int | None:
@@ -338,11 +350,20 @@ def selected_high_level_code(step) -> int | None:
 def low_level_kind_for_code(action_code: int) -> OptionKind:
     return low_level_spec_for_code(int(action_code)).kind
 
+def try_low_level_kind_for_code(action_code: int) -> OptionKind | None:
+    spec = try_low_level_spec_for_code(int(action_code))
+    return spec.kind if spec is not None else None
+
 
 def semantic_action_key_for_code(action_code: int) -> tuple[Any, ...]:
     spec = low_level_spec_for_code(int(action_code))
     return semantic_action_key_for_spec(spec)
 
+def try_semantic_action_key_for_code(action_code: int) -> tuple[Any, ...] | None:
+    spec = try_low_level_spec_for_code(int(action_code))
+    if spec is None:
+        return None
+    return semantic_action_key_for_spec(spec)
 
 def semantic_action_key_for_spec(spec: LowLevelActionSpec) -> tuple[Any, ...]:
     return (
@@ -370,6 +391,13 @@ def semantic_action_key_for_spec(spec: LowLevelActionSpec) -> tuple[Any, ...]:
 
 def public_spent_dice_for_code(action_code: int) -> int:
     spec = low_level_spec_for_code(int(action_code))
+    return public_spent_dice_for_spec(spec)
+
+
+def try_public_spent_dice_for_code(action_code: int) -> int | None:
+    spec = try_low_level_spec_for_code(int(action_code))
+    if spec is None:
+        return None
     return public_spent_dice_for_spec(spec)
 
 

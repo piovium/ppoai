@@ -94,11 +94,49 @@ class _SearchTimeout(RuntimeError):
 def phase_budget_for_context(context: DecisionContext, *, config: SePotSearchConfig) -> SePotPhaseBudget:
     round_number = int(context.player_view.round_number) if context.player_view is not None else 0
     if round_number <= 3:
-        return SePotPhaseBudget(depth=1, root_top_k=2, belief_samples=1, timeout_ms=config.opening_timeout_ms)
+        return SePotPhaseBudget(depth=1, root_top_k=2, belief_samples=2, timeout_ms=config.opening_timeout_ms)
     if round_number <= 8:
-        return SePotPhaseBudget(depth=2, root_top_k=3, belief_samples=2, timeout_ms=config.midgame_timeout_ms)
-    return SePotPhaseBudget(depth=2, root_top_k=4, belief_samples=3, timeout_ms=config.endgame_timeout_ms)
+        return SePotPhaseBudget(depth=2, root_top_k=3, belief_samples=4, timeout_ms=config.midgame_timeout_ms)
+    return SePotPhaseBudget(depth=3, root_top_k=4, belief_samples=6, timeout_ms=config.endgame_timeout_ms)
 
+
+def _select_root_candidate_indices(
+    *,
+    context: DecisionContext,
+    policy_log_probs: Sequence[float],
+    budget: SePotPhaseBudget,
+) -> tuple[int, ...]:
+    if not policy_log_probs or not context.legal_low_level_codes:
+        return ()
+    ranked = sorted(range(len(policy_log_probs)), key=lambda index: float(policy_log_probs[index]), reverse=True)
+    limit = max(1, min(len(ranked), int(budget.root_top_k)))
+    selected: list[int] = []
+    declare_end_index: int | None = None
+    for index in ranked:
+        action_code = int(context.legal_low_level_codes[index])
+        try:
+            kind = low_level_kind_for_code(action_code)
+        except Exception:
+            kind = None
+        if kind == OptionKind.ACTION_DECLARE_END:
+            if declare_end_index is None:
+                declare_end_index = index
+            continue
+        selected.append(index)
+        if len(selected) >= max(1, limit - 1):
+            break
+    if declare_end_index is not None and len(selected) < limit:
+        selected.append(declare_end_index)
+    if not selected:
+        selected = ranked[:limit]
+    elif len(selected) < limit:
+        for index in ranked:
+            if index in selected:
+                continue
+            selected.append(index)
+            if len(selected) >= limit:
+                break
+    return tuple(selected[:limit])
 
 
 def should_trigger_search(
@@ -114,139 +152,12 @@ def should_trigger_search(
         return False
     legal_count = len(context.legal_low_level_codes)
     round_number = int(context.player_view.round_number)
-    has_end = any(
-        low_level_kind_for_code(int(action_code)) == OptionKind.ACTION_DECLARE_END
-        for action_code in context.legal_low_level_codes
-    )
-    productive_non_end = any(
-        low_level_kind_for_code(int(action_code)) in {
-            OptionKind.ACTION_USE_SKILL,
-            OptionKind.ACTION_PLAY_CARD,
-            OptionKind.ACTION_ELEMENTAL_TUNING,
-        }
-        for action_code in context.legal_low_level_codes
-    )
-    # Paper-aligned principle: search should be forced by tactical / structural
-    # ambiguity, not vetoed by the learned policy. Tactical opportunities and
-    # end-vs-continue conflicts must enter search even when the policy is very
-    # confident.
-    if _tactical_trigger_reason(context) is not None:
-        return True
-    if has_end and productive_non_end:
-        return True
-    if legal_count >= 8:
-        return True
-    if round_number >= 6 and legal_count >= 3:
-        return True
-    return False
-
-def _top_two_logprob_margin(policy_log_probs: Sequence[float]) -> float:
-    if len(policy_log_probs) < 2:
-        return 999.0
-    ordered = sorted((float(value) for value in policy_log_probs), reverse=True)
-    return float(ordered[0] - ordered[1])
-
-
-def _should_search_for_policy(
-    *,
-    context: DecisionContext,
-    policy_log_probs: Sequence[float],
-) -> bool:
-    if len(policy_log_probs) < 2:
-        return False
-    round_number = int(context.player_view.round_number) if context.player_view is not None else 0
-    legal_count = len(context.legal_low_level_codes)
-    margin = _top_two_logprob_margin(policy_log_probs)
-    has_end = any(
-        low_level_kind_for_code(int(action_code)) == OptionKind.ACTION_DECLARE_END
-        for action_code in context.legal_low_level_codes
-    )
-    productive_non_end = any(
-        low_level_kind_for_code(int(action_code)) in {
-            OptionKind.ACTION_USE_SKILL,
-            OptionKind.ACTION_PLAY_CARD,
-            OptionKind.ACTION_ELEMENTAL_TUNING,
-        }
-        for action_code in context.legal_low_level_codes
-    )
-
+    legal_kinds = _legal_option_kinds(context)
+    has_end = OptionKind.ACTION_DECLARE_END in legal_kinds
+    productive_non_end = any(kind in _PRODUCTIVE_ACTION_KINDS for kind in legal_kinds)
     if round_number <= 3:
-        if has_end and productive_non_end:
-            return margin < 1.35 or legal_count >= 8
-        return legal_count >= 7 and margin < 0.85
-
-    if round_number <= 8:
-        if has_end and productive_non_end:
-            return margin < 1.50 or legal_count >= 7
-        return legal_count >= 5 and margin < 0.95
-
-    if has_end and productive_non_end:
-        return margin < 1.75 or legal_count >= 6
-    return legal_count >= 4 and margin < 1.15
-
-
-def _select_root_candidate_indices(
-    *,
-    context: DecisionContext,
-    policy_log_probs: Sequence[float],
-    budget: SePotPhaseBudget,
-) -> tuple[int, ...]:
-    ranked = sorted(range(len(policy_log_probs)), key=lambda index: float(policy_log_probs[index]), reverse=True)
-    if not ranked:
-        return ()
-
-    margin = _top_two_logprob_margin(policy_log_probs)
-    if margin >= 1.50:
-        limit = 1
-    elif margin >= 0.80:
-        limit = min(2, budget.root_top_k)
-    elif margin >= 0.35:
-        limit = min(3, budget.root_top_k)
-    else:
-        limit = min(4, budget.root_top_k)
-
-    end_indices = [
-        index
-        for index in ranked
-        if low_level_kind_for_code(int(context.legal_low_level_codes[index])) == OptionKind.ACTION_DECLARE_END
-    ]
-    non_end_indices = [
-        index
-        for index in ranked
-        if low_level_kind_for_code(int(context.legal_low_level_codes[index])) != OptionKind.ACTION_DECLARE_END
-    ]
-
-    chosen: list[int] = []
-
-    if non_end_indices:
-        chosen.append(non_end_indices[0])
-    else:
-        chosen.append(ranked[0])
-
-    if end_indices:
-        best_non_end_logp = float(policy_log_probs[chosen[0]])
-        best_end_index = end_indices[0]
-        best_end_logp = float(policy_log_probs[best_end_index])
-        include_end = (
-            not non_end_indices
-            or abs(best_non_end_logp - best_end_logp) <= 0.60
-            or (len(context.legal_low_level_codes) >= 8 and best_end_logp >= best_non_end_logp - 0.90)
-        )
-        if include_end and best_end_index not in chosen and len(chosen) < limit:
-            chosen.append(best_end_index)
-
-    for index in ranked:
-        if index in chosen:
-            continue
-        kind = low_level_kind_for_code(int(context.legal_low_level_codes[index]))
-        if kind == OptionKind.ACTION_DECLARE_END:
-            continue
-        chosen.append(index)
-        if len(chosen) >= limit:
-            break
-
-    return tuple(chosen[: max(1, limit)])
-
+        return legal_count >= 6 or (has_end and productive_non_end)
+    return round_number >= 4 and legal_count >= 2
 
 
 def build_public_belief_state(
@@ -841,8 +752,6 @@ class SePotSearchController:
         del encoded, search_option_logits_fn
         if not should_trigger_search(context, config=self.config):
             return None
-        if not _should_search_for_policy(context=context, policy_log_probs=policy_log_probs):
-            return None
         budget = phase_budget_for_context(context, config=self.config)
         matchup = _matchup_from_key(str(context.metadata.get("matchup", "")))
         if matchup is None:
@@ -997,7 +906,6 @@ class SePotSearchController:
             belief_sample_count=public_belief.opponent_range.count,
             phase_depth=budget.depth,
         )
-
 
     def _evaluate_root_candidate(
         self,
@@ -1449,184 +1357,6 @@ class SePotSearchController:
             current_tracker,
         )
 
-
-
-def _semantic_key_dict(action_code: int) -> dict[str, object]:
-    return dict(semantic_action_key_for_code(int(action_code)))
-
-
-def _active_character_index(player) -> int:
-    for index, character in enumerate(player.characters):
-        if bool(character.is_active):
-            return int(index)
-    return 0
-
-
-def _targets_opponent_frontline(action_code: int) -> bool:
-    target_slots = _semantic_key_dict(action_code).get("target_slots")
-    if not isinstance(target_slots, tuple):
-        return False
-    return any(
-        owner == "opponent" and zone == "character" and int(index) == 0
-        for owner, zone, index in target_slots
-    )
-
-
-def _targets_opponent_backline(action_code: int) -> bool:
-    target_slots = _semantic_key_dict(action_code).get("target_slots")
-    if not isinstance(target_slots, tuple):
-        return False
-    return any(
-        owner == "opponent" and zone == "character" and int(index) > 0
-        for owner, zone, index in target_slots
-    )
-
-
-def _tactical_trigger_reason(context: DecisionContext) -> str | None:
-    visible_state = context.player_view
-    if visible_state is None or context.request_type != DecisionType.ACTION:
-        return None
-    acting_player = int(context.acting_player)
-    opponent = visible_state.players[1 - acting_player]
-    opponent_active = opponent.characters[_active_character_index(opponent)]
-    opponent_front_hp = int(opponent_active.health)
-    has_end = False
-    has_productive_non_end = False
-    frontline_pressure = False
-    backline_pressure = False
-    for action_code in context.legal_low_level_codes:
-        kind = low_level_kind_for_code(int(action_code))
-        if kind == OptionKind.ACTION_DECLARE_END:
-            has_end = True
-            continue
-        if kind in {
-            OptionKind.ACTION_USE_SKILL,
-            OptionKind.ACTION_PLAY_CARD,
-            OptionKind.ACTION_ELEMENTAL_TUNING,
-            OptionKind.ACTION_SWITCH_ACTIVE,
-        }:
-            has_productive_non_end = True
-        if kind in {OptionKind.ACTION_USE_SKILL, OptionKind.ACTION_PLAY_CARD}:
-            if _targets_opponent_frontline(int(action_code)):
-                frontline_pressure = True
-            if _targets_opponent_backline(int(action_code)):
-                backline_pressure = True
-    if opponent_front_hp <= 3 and frontline_pressure:
-        return "frontline_lethal_window"
-    if opponent_front_hp <= 5 and frontline_pressure and has_end:
-        return "frontline_pressure_vs_end"
-    if backline_pressure and has_end:
-        return "backline_pressure_vs_end"
-    if has_end and has_productive_non_end:
-        return "end_conflict"
-    return None
-
-
-def _top_policy_margin(policy_log_probs: Sequence[float]) -> float:
-    if len(policy_log_probs) < 2:
-        return float("inf")
-    ranked = sorted((float(v) for v in policy_log_probs), reverse=True)
-    return float(ranked[0] - ranked[1])
-
-
-def _tactical_priority_score(context: DecisionContext, action_code: int) -> float:
-    visible_state = context.player_view
-    if visible_state is None:
-        return 0.0
-    acting_player = int(context.acting_player)
-    opponent = visible_state.players[1 - acting_player]
-    opponent_active = opponent.characters[_active_character_index(opponent)]
-    opponent_front_hp = int(opponent_active.health)
-    kind = low_level_kind_for_code(int(action_code))
-    score = 0.0
-    if kind == OptionKind.ACTION_DECLARE_END:
-        return -10.0
-    if kind in {OptionKind.ACTION_USE_SKILL, OptionKind.ACTION_PLAY_CARD}:
-        if _targets_opponent_frontline(int(action_code)):
-            score += 4.0
-            if opponent_front_hp <= 5:
-                score += 3.0
-            if opponent_front_hp <= 3:
-                score += 5.0
-        if _targets_opponent_backline(int(action_code)):
-            score += 1.5
-    if kind == OptionKind.ACTION_SWITCH_ACTIVE and opponent_front_hp <= 3:
-        score += 1.0
-    if kind == OptionKind.ACTION_ELEMENTAL_TUNING and opponent_front_hp <= 3:
-        score -= 1.0
-    score -= 0.1 * float(public_spent_dice_for_code(int(action_code)))
-    return score
-
-
-def _prioritized_root_indices(
-    *,
-    context: DecisionContext,
-    policy_log_probs: Sequence[float],
-    budget: SePotPhaseBudget,
-) -> tuple[int, ...]:
-    if not context.legal_low_level_codes:
-        return ()
-    tactical_reason = _tactical_trigger_reason(context)
-    margin = _top_policy_margin(policy_log_probs)
-    legal_count = len(context.legal_low_level_codes)
-    limit = max(1, min(len(context.legal_low_level_codes), int(budget.root_top_k)))
-    # Policy provides a prior only for non-tactical states. Tactical states keep
-    # their wider budget so search can correct confident but tactically-wrong policies.
-    if tactical_reason is None:
-        if legal_count <= 4 and margin >= 1.50:
-            limit = 1
-        elif margin >= 1.00:
-            limit = min(limit, 2)
-        elif margin >= 0.60:
-            limit = min(limit, 3)
-    else:
-        limit = max(limit, 3)
-
-    ranked_by_policy = sorted(
-        range(len(policy_log_probs)),
-        key=lambda index: float(policy_log_probs[index]),
-        reverse=True,
-    )
-    candidate_pool = ranked_by_policy[: max(limit * 3, limit)]
-    tactical_ranked = sorted(
-        candidate_pool,
-        key=lambda index: (
-            _tactical_priority_score(context, int(context.legal_low_level_codes[index])),
-            float(policy_log_probs[index]),
-        ),
-        reverse=True,
-    )
-
-    selected: list[int] = []
-    seen: set[int] = set()
-    declare_end_added = False
-
-    def consider(index: int) -> None:
-        nonlocal declare_end_added
-        if index in seen:
-            return
-        action_code = int(context.legal_low_level_codes[index])
-        kind = low_level_kind_for_code(action_code)
-        if kind == OptionKind.ACTION_DECLARE_END:
-            if declare_end_added:
-                return
-            declare_end_added = True
-        seen.add(index)
-        selected.append(index)
-
-    # Keep tactically meaningful actions first, then fill with policy prior.
-    for index in tactical_ranked:
-        action_code = int(context.legal_low_level_codes[index])
-        if _tactical_priority_score(context, action_code) > 0.0:
-            consider(index)
-        if len(selected) >= limit:
-            return tuple(selected[:limit])
-
-    for index in ranked_by_policy:
-        consider(index)
-        if len(selected) >= limit:
-            break
-    return tuple(selected[:limit])
 
 def _build_self_range_from_state(state: StateSnapshot, *, player_id: int) -> ExplicitRange:
     player = state.players[player_id]

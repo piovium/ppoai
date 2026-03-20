@@ -72,7 +72,7 @@ def build_decision_context(
     full_state_json: str | None,
     step_index: int,
     metadata: dict[str, Any] | None = None,
-    enable_result_based_action_relabel: bool = True,
+    enable_result_based_action_relabel: bool = False,
 ) -> BuiltDecisionContext:
     metadata = metadata or {}
     builder = {
@@ -97,6 +97,9 @@ def build_decision_context(
     if (
         enable_result_based_action_relabel
         and request_type == DecisionType.ACTION
+        # Online acting/search stays on the pre-state intent taxonomy. Outcome-
+        # based relabel is an offline analysis/training tool and must not sit on
+        # the hot path.
         and full_state_json
         and encoded_actions.legal_low_level_codes
     ):

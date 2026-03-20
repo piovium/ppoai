@@ -1,0 +1,142 @@
+diff --git a/research/world_model/src/gitcg_world_model/sepot_search.py b/research/world_model/src/gitcg_world_model/sepot_search.py
+--- a/research/world_model/src/gitcg_world_model/sepot_search.py
++++ b/research/world_model/src/gitcg_world_model/sepot_search.py
+@@ -3,6 +3,25 @@
+                     step.post_state,
+                     player_id=1 - root_public_belief.root_player,
+                 )
++                next_depth = max(0, budget.depth - 1)
++                if next_depth <= 0:
++                    cheap_public_belief = _singleton_public_belief_after_step(
++                        pre_public_belief=root_public_belief,
++                        post_state=step.post_state,
++                        next_context=next_context,
++                        tracker=branch_tracker,
++                        sampled_self_hypothesis=sampled_self_hypothesis,
++                        sampled_opponent_hypothesis=sampled_opponent_hypothesis,
++                    )
++                    return _leaf_value(
++                        public_belief=cheap_public_belief,
++                        current_context=next_context,
++                        budget=budget,
++                        card_vocabulary=self.card_vocabulary,
++                        device=device,
++                        search_state_value_fn=search_state_value_fn,
++                        cache=leaf_value_cache,
++                    )
+                 update_result = updater.update_after_step(
+                     pre_public_belief=root_public_belief,
+                     selected_action_code=selected_action_code,
+@@ -21,7 +40,7 @@
+                     current_history=branch_history,
+                     root_player=root_public_belief.root_player,
+                     budget=budget,
+-                    depth_remaining=max(0, budget.depth - 1),
++                    depth_remaining=next_depth,
+                     model=model,
+                     encoder=encoder,
+                     device=device,
+@@ -2,6 +2,25 @@
+             tracker.observe_step(step)
+             sampled_self_hypothesis = _extract_player_hypothesis(step.post_state, player_id=root_player)
+             sampled_opponent_hypothesis = _extract_player_hypothesis(step.post_state, player_id=1 - root_player)
++            next_depth = depth_remaining - 1
++            if next_depth <= 0:
++                cheap_public_belief = _singleton_public_belief_after_step(
++                    pre_public_belief=current_public_belief,
++                    post_state=step.post_state,
++                    next_context=next_context,
++                    tracker=tracker,
++                    sampled_self_hypothesis=sampled_self_hypothesis,
++                    sampled_opponent_hypothesis=sampled_opponent_hypothesis,
++                )
++                return _leaf_value(
++                    public_belief=cheap_public_belief,
++                    current_context=next_context,
++                    budget=budget,
++                    card_vocabulary=self.card_vocabulary,
++                    device=device,
++                    search_state_value_fn=search_state_value_fn,
++                    cache=leaf_value_cache,
++                )
+             update_result = updater.update_after_step(
+                 pre_public_belief=current_public_belief,
+                 selected_action_code=selected_action_code,
+@@ -20,7 +39,7 @@
+                 current_history=current_history,
+                 root_player=root_player,
+                 budget=budget,
+-                depth_remaining=depth_remaining - 1,
++                depth_remaining=next_depth,
+                 model=model,
+                 encoder=encoder,
+                 device=device,
+@@ -2,6 +2,25 @@
+             tracker.observe_step(step)
+             sampled_self_hypothesis = _extract_player_hypothesis(step.post_state, player_id=root_player)
+             sampled_opponent_hypothesis = _extract_player_hypothesis(step.post_state, player_id=1 - root_player)
++            next_depth = depth_remaining - 1
++            if next_depth <= 0:
++                cheap_public_belief = _singleton_public_belief_after_step(
++                    pre_public_belief=current_public_belief,
++                    post_state=step.post_state,
++                    next_context=next_context,
++                    tracker=tracker,
++                    sampled_self_hypothesis=sampled_self_hypothesis,
++                    sampled_opponent_hypothesis=sampled_opponent_hypothesis,
++                )
++                return _leaf_value(
++                    public_belief=cheap_public_belief,
++                    current_context=next_context,
++                    budget=budget,
++                    card_vocabulary=self.card_vocabulary,
++                    device=device,
++                    search_state_value_fn=search_state_value_fn,
++                    cache=leaf_value_cache,
++                )
+             update_result = updater.update_after_step(
+                 pre_public_belief=current_public_belief,
+                 selected_action_code=int(child_context.legal_low_level_codes[matched]),
+@@ -20,7 +39,7 @@
+                 current_history=child_history,
+                 root_player=root_player,
+                 budget=budget,
+-                depth_remaining=depth_remaining - 1,
++                depth_remaining=next_depth,
+                 model=model,
+                 encoder=encoder,
+                 device=device,
+@@ -13,4 +13,33 @@
+     )
+
+
++def _singleton_public_belief_after_step(
++    *,
++    pre_public_belief: PublicBeliefState,
++    post_state: StateSnapshot,
++    next_context: DecisionContext | None,
++    tracker: PublicStateTracker,
++    sampled_self_hypothesis: ExplicitRangeHypothesis,
++    sampled_opponent_hypothesis: ExplicitRangeHypothesis,
++) -> PublicBeliefState:
++    public_state = mask_state_for_player(post_state, perspective_player=pre_public_belief.root_player)
++    return PublicBeliefState(
++        root_player=pre_public_belief.root_player,
++        acting_player=(
++            int(next_context.acting_player)
++            if next_context is not None
++            else int(public_state.current_turn)
++        ),
++        public_state=public_state,
++        round_number=int(public_state.round_number),
++        phase=str(public_state.phase),
++        opponent_public_dice_count=tracker.opponent_public_dice_count_from_state(public_state),
++        opponent_public_hand_count=tracker.opponent_public_hand_count_from_state(public_state),
++        self_range=ExplicitRange((replace_weight(sampled_self_hypothesis, 1.0),)),
++        opponent_range=ExplicitRange((replace_weight(sampled_opponent_hypothesis, 1.0),)),
++        public_history=tracker.public_history(),
++        revealed_opponent_card_definition_ids=tracker.revealed_opponent_card_definition_ids(),
++    )
++
++
+ def _leaf_value(

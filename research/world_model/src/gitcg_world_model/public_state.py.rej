@@ -1,0 +1,40 @@
+diff a/research/world_model/src/gitcg_world_model/public_state.py b/research/world_model/src/gitcg_world_model/public_state.py	(rejected hunks)
+@@ -1,22 +1,27 @@
+         round_number = int(step.player_view.round_number) if step.player_view is not None else 0
+         phase = str(step.player_view.phase) if step.player_view is not None else ""
++        semantic_key = None
++        option_kind = selected_spec.kind.value if selected_spec is not None else None
++        used_dice_count = 0
++        if selected_spec is not None:
++            semantic_key = semantic_action_key_for_spec(selected_spec)
++            used_dice_count = public_spent_dice_for_spec(selected_spec)
++        elif action_code is not None:
++            try:
++                semantic_key = semantic_action_key_for_code(action_code)
++                used_dice_count = public_spent_dice_for_code(action_code)
++            except KeyError:
++                semantic_key = None
++                used_dice_count = 0
+         record = PublicActionRecord(
+             acting_player=int(step.acting_player),
+             request_type=step.request_type,
+             round_number=round_number,
+             phase=phase,
+             payload=payload,
+-            semantic_key=(
+-                semantic_action_key_for_spec(selected_spec)
+-                if selected_spec is not None
+-                else (semantic_action_key_for_code(action_code) if action_code is not None else None)
+-            ),
+-            option_kind=(selected_spec.kind.value if selected_spec is not None else None),
+-            used_dice_count=(
+-                public_spent_dice_for_spec(selected_spec)
+-                if selected_spec is not None
+-                else (public_spent_dice_for_code(action_code) if action_code is not None else 0)
+-            ),
++            semantic_key=semantic_key,
++            option_kind=option_kind,
++            used_dice_count=used_dice_count,
+             known_payload=known_payload,
+             selected_legal_index=selected_legal_index,
+             legal_option_count=len(step.legal_low_level_codes),

@@ -1,0 +1,8 @@
+diff a/research/world_model/src/gitcg_world_model/action_adapter.py b/research/world_model/src/gitcg_world_model/action_adapter.py	(rejected hunks)
+@@ -8,5 +8,5 @@
+     full_state_json: str | None,
+     step_index: int,
+     metadata: dict[str, Any] | None = None,
+-    enable_result_based_action_relabel: bool = True,
++    enable_result_based_action_relabel: bool = False,
+ ) -> BuiltDecisionContext:
