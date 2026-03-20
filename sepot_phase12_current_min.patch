@@ -1,0 +1,72 @@
+--- a/research/world_model/src/gitcg_world_model/sepot_search.py
++++ b/research/world_model/src/gitcg_world_model/sepot_search.py
+@@ -717,6 +717,9 @@
+                 self._advance_cache[cache_key] = updated_opponent_range
+                 if len(self._advance_cache) > 256:
+                     self._advance_cache.clear()
++        next_opponent_public_dice_count = tracker.opponent_public_dice_count_from_state(public_state)
++        next_opponent_public_hand_count = tracker.opponent_public_hand_count_from_state(public_state)
++        next_revealed = tracker.revealed_opponent_card_definition_ids()
+         updated = PublicBeliefState(
+             root_player=pre_public_belief.root_player,
+             acting_player=(
+@@ -732,7 +735,7 @@
+             self_range=ExplicitRange((sampled_self_hypothesis,)),
+             opponent_range=updated_opponent_range,
+             public_history=tracker.public_history(),
+-            revealed_opponent_card_definition_ids=next_revealed,
++            revealed_opponent_card_definition_ids=tuple(int(value) for value in next_revealed),
+         )
+         return _RangeUpdateResult(
+             updated_public_belief=updated,
+@@ -896,13 +899,6 @@
+             self._updater_cache[cache_key] = updater
+         policy_cache: dict[tuple[Any, ...], tuple[float, ...]] = {}
+         leaf_value_cache: dict[tuple[Any, ...], float] = {}
+-        if reconstructor.ensure_template(acting_player=root_player) is None:
+-            return _fallback_decision(
+-                reason="template_unavailable",
+-                policy_log_probs=policy_log_probs,
+-                phase_depth=budget.depth,
+-                belief_sample_count=public_belief.opponent_range.count,
+-            )
+         deadline = time.perf_counter() + (float(budget.timeout_ms) / 1000.0)
+         root_indices = _prioritized_root_indices(
+             context=context,
+@@ -1025,11 +1021,31 @@
+     ) -> float | None:
+         try:
+             sampled_self_hypothesis = root_public_belief.self_range.hypotheses[0]
+-            env, current_context = reconstructor.reconstruct(
+-                public_belief=root_public_belief,
+-                self_hypothesis=sampled_self_hypothesis,
+-                opponent_hypothesis=sampled_opponent_hypothesis,
+-            )
++            env: GitcgDecisionEnv | None = None
++            current_context: DecisionContext | None = None
++            root_state_json = root_context.full_state_json
++            if root_state_json:
++                try:
++                    env = GitcgDecisionEnv(
++                        reconstructor.env_config,
++                        reconstructor.matchup,
++                        enable_result_based_action_relabel=False,
++                    )
++                    current_context = env.reset(
++                        seed=reconstructor.config.template_seed,
++                        state_json=root_state_json,
++                    )
++                except Exception:
++                    if env is not None:
++                        env.close()
++                    env = None
++                    current_context = None
++            if env is None or current_context is None:
++                env, current_context = reconstructor.reconstruct(
++                    public_belief=root_public_belief,
++                    self_hypothesis=sampled_self_hypothesis,
++                    opponent_hypothesis=sampled_opponent_hypothesis,
++                )
+             if env is None or current_context is None:
+                 return None
+             branch_history = list(root_history)
