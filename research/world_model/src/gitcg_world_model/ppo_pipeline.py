@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import math
+import os
 import random
 import shutil
 import time
@@ -51,7 +54,7 @@ from .managed_loop_utils import (
     write_episode_analysis,
     write_runtime_manifest,
 )
-from .replay import append_episode_records, load_episode_records
+from .replay import append_episode_records, iter_episode_records, load_episode_records
 from .schema import EnvConfig, EpisodeRecord, Matchup
 
 
@@ -807,6 +810,11 @@ def _load_completed_round_results(workspace_path: Path) -> list[PpoManagedRoundR
             continue
         train_artifacts = load_ppo_train_artifacts(round_dir / "train")
         analysis_path = round_dir / "analysis.json"
+        bootstrap_episodes: tuple[EpisodeRecord, ...] = ()
+        self_play_episodes: tuple[EpisodeRecord, ...] = ()
+        replay_episodes: tuple[EpisodeRecord, ...] = ()
+        br_self_play_episodes: tuple[EpisodeRecord, ...] = ()
+        br_replay_episodes: tuple[EpisodeRecord, ...] = ()
         self_play_path = round_dir / "self_play.jsonl"
         if train_artifacts is None or not analysis_path.exists() or not self_play_path.exists():
             continue
@@ -829,20 +837,301 @@ def _load_completed_round_results(workspace_path: Path) -> list[PpoManagedRoundR
     return results
 
 
+
+
+_REPLAY_MEMORY_CHECK_INTERVAL = 64
+_REPLAY_DEFAULT_MAX_PER_FILE = 768
+_REPLAY_DEFAULT_MAX_TOTAL = 2048
+_REPLAY_ENV_MAX_PER_FILE = "GITCG_REPLAY_MAX_PER_FILE"
+_REPLAY_ENV_MAX_TOTAL = "GITCG_REPLAY_MAX_TOTAL"
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _process_rss_bytes() -> int | None:
+    if os.name == "nt":
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        process_handle = kernel32.GetCurrentProcess()
+        ok = psapi.GetProcessMemoryInfo(
+            process_handle,
+            ctypes.byref(counters),
+            counters.cb,
+        )
+        if not ok:
+            return None
+        return int(counters.WorkingSetSize)
+
+    try:
+        statm_path = Path("/proc/self/statm")
+        if statm_path.exists():
+            fields = statm_path.read_text(encoding="utf-8").split()
+            if len(fields) >= 2:
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                return int(fields[1]) * int(page_size)
+    except Exception:
+        pass
+    return None
+
+
+def _available_memory_bytes() -> int | None:
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        if not ok:
+            return None
+        return int(status.ullAvailPhys)
+
+    meminfo_path = Path("/proc/meminfo")
+    if meminfo_path.exists():
+        try:
+            for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+        except Exception:
+            pass
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        return page_size * available_pages
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _select_replay_load_limits() -> tuple[int, int]:
+    override_per_file = _env_int(_REPLAY_ENV_MAX_PER_FILE)
+    override_total = _env_int(_REPLAY_ENV_MAX_TOTAL)
+    if override_per_file is not None or override_total is not None:
+        max_per_file = max(
+            0,
+            override_per_file if override_per_file is not None else _REPLAY_DEFAULT_MAX_PER_FILE,
+        )
+        max_total = max(
+            0,
+            override_total if override_total is not None else _REPLAY_DEFAULT_MAX_TOTAL,
+        )
+        return max_per_file, max_total
+
+    gib = 1024 ** 3
+    rss = _process_rss_bytes()
+    available = _available_memory_bytes()
+
+    if available is not None and available < (2 * gib):
+        return 64, 256
+    if rss is not None and rss >= (28 * gib):
+        return 64, 256
+    if available is not None and available < (4 * gib):
+        return 128, 512
+    if rss is not None and rss >= (24 * gib):
+        return 128, 512
+    if available is not None and available < (8 * gib):
+        return 256, 1024
+    if rss is not None and rss >= (20 * gib):
+        return 256, 1024
+    if available is not None and available < (12 * gib):
+        return 512, 1536
+    if rss is not None and rss >= (16 * gib):
+        return 512, 1536
+    return _REPLAY_DEFAULT_MAX_PER_FILE, _REPLAY_DEFAULT_MAX_TOTAL
+
+
+def _replay_memory_pressure_hard() -> bool:
+    gib = 1024 ** 3
+    rss = _process_rss_bytes()
+    available = _available_memory_bytes()
+    if available is not None and available < int(1.5 * gib):
+        return True
+    if rss is not None and rss >= (29 * gib):
+        return True
+    return False
+
+
+def _collect_recent_replay_paths(
+    workspace_path: Path,
+    *,
+    current_round: int,
+    replay_round_window: int,
+    include_br: bool,
+) -> list[Path]:
+    paths: list[Path] = []
+    round_start = max(1, current_round - replay_round_window)
+    for round_index in range(current_round - 1, round_start - 1, -1):
+        round_dir = workspace_path / f"round_{round_index:04d}"
+        primary_path = round_dir / "self_play.jsonl"
+        if primary_path.exists():
+            paths.append(primary_path)
+        if include_br:
+            br_path = round_dir / "br_self_play.jsonl"
+            if br_path.exists():
+                paths.append(br_path)
+    return paths
+
+
+def _load_replay_episodes_with_budget(
+    paths: Sequence[Path],
+    *,
+    label: str,
+) -> tuple[EpisodeRecord, ...]:
+    if not paths:
+        return ()
+
+    gc.collect()
+    max_per_file, max_total = _select_replay_load_limits()
+    if max_per_file <= 0 or max_total <= 0:
+        return ()
+
+    replay_episodes: list[EpisodeRecord] = []
+    stop_reason: str | None = None
+    loaded_paths = 0
+
+    for path in paths:
+        remaining_total = max_total - len(replay_episodes)
+        if remaining_total <= 0:
+            stop_reason = "total_budget"
+            break
+
+        dynamic_per_file, dynamic_total = _select_replay_load_limits()
+        remaining_dynamic_total = max(0, dynamic_total - len(replay_episodes))
+        effective_per_file = min(
+            max_per_file,
+            dynamic_per_file,
+            remaining_total,
+            remaining_dynamic_total,
+        )
+        if effective_per_file <= 0:
+            stop_reason = "dynamic_budget"
+            break
+
+        loaded_from_path = 0
+        for episode in iter_episode_records(path):
+            replay_episodes.append(episode)
+            loaded_from_path += 1
+
+            if loaded_from_path >= effective_per_file:
+                stop_reason = "per_file_budget"
+                break
+            if len(replay_episodes) >= max_total:
+                stop_reason = "total_budget"
+                break
+            if (
+                loaded_from_path % _REPLAY_MEMORY_CHECK_INTERVAL == 0
+                and _replay_memory_pressure_hard()
+            ):
+                stop_reason = "memory_pressure"
+                break
+
+        loaded_paths += 1
+        if stop_reason in {"total_budget", "dynamic_budget", "memory_pressure"}:
+            break
+        stop_reason = None
+
+    if stop_reason is not None or loaded_paths < len(paths):
+        print(
+            "[replay-budget] "
+            f"label={label} "
+            f"episodes={len(replay_episodes)} "
+            f"files={loaded_paths}/{len(paths)} "
+            f"max_per_file={max_per_file} "
+            f"max_total={max_total} "
+            f"stop={stop_reason or 'completed'}",
+            flush=True,
+        )
+
+    return tuple(replay_episodes)
+
+
+def _compose_replay_buffer(
+    *episode_groups: Sequence[EpisodeRecord],
+    label: str,
+) -> tuple[EpisodeRecord, ...]:
+    _, max_total = _select_replay_load_limits()
+    if max_total <= 0:
+        return ()
+
+    combined: list[EpisodeRecord] = []
+    total_requested = 0
+    for group in episode_groups:
+        total_requested += len(group)
+        remaining = max_total - len(combined)
+        if remaining <= 0:
+            break
+        if len(group) <= remaining:
+            combined.extend(group)
+        else:
+            combined.extend(group[:remaining])
+            break
+
+    if len(combined) < total_requested:
+        print(
+            "[replay-budget] "
+            f"label={label} "
+            f"episodes={len(combined)} "
+            f"requested={total_requested} "
+            f"max_total={max_total} "
+            "stop=compose_budget",
+            flush=True,
+        )
+
+    return tuple(combined)
+
 def _load_recent_replay_episodes(
     workspace_path: Path,
     *,
     current_round: int,
     replay_round_window: int = 3,
 ) -> tuple[EpisodeRecord, ...]:
-    replay_episodes: list[EpisodeRecord] = []
-    round_start = max(1, current_round - replay_round_window)
-    for round_index in range(round_start, current_round):
-        self_play_path = workspace_path / f"round_{round_index:04d}" / "self_play.jsonl"
-        if not self_play_path.exists():
-            continue
-        replay_episodes.extend(load_episode_records(self_play_path))
-    return tuple(replay_episodes)
+    return _load_replay_episodes_with_budget(
+        _collect_recent_replay_paths(
+            workspace_path,
+            current_round=current_round,
+            replay_round_window=replay_round_window,
+            include_br=False,
+        ),
+        label="recent_replay",
+    )
 
 
 def _load_recent_p2sro_replay_episodes(
@@ -851,14 +1140,15 @@ def _load_recent_p2sro_replay_episodes(
     current_round: int,
     replay_round_window: int = 3,
 ) -> tuple[EpisodeRecord, ...]:
-    replay_episodes: list[EpisodeRecord] = []
-    round_start = max(1, current_round - replay_round_window)
-    for round_index in range(round_start, current_round):
-        for relative_path in ("self_play.jsonl", "br_self_play.jsonl"):
-            path = workspace_path / f"round_{round_index:04d}" / relative_path
-            if path.exists():
-                replay_episodes.extend(load_episode_records(path))
-    return tuple(replay_episodes)
+    return _load_replay_episodes_with_budget(
+        _collect_recent_replay_paths(
+            workspace_path,
+            current_round=current_round,
+            replay_round_window=replay_round_window,
+            include_br=True,
+        ),
+        label="recent_p2sro_replay",
+    )
 
 
 def collect_bootstrap_episodes(
@@ -1994,7 +2284,11 @@ def run_ppo_managed_loop(
                 round_index=round_index,
                 analytics=br_self_play_analysis,
             )
-            br_replay_episodes = tuple(replay_episodes) + tuple(self_play_episodes)
+            br_replay_episodes = _compose_replay_buffer(
+                self_play_episodes,
+                replay_episodes,
+                label="br_train_replay",
+            )
             br_train_artifacts = train_ppo_from_episodes(
                 episodes=br_self_play_episodes,
                 replay_episodes=br_replay_episodes,
@@ -2211,6 +2505,12 @@ def run_ppo_managed_loop(
                 "late_round_rate": float(self_play_analysis.late_round_rate),
             },
         )
+        bootstrap_episodes = ()
+        self_play_episodes = ()
+        replay_episodes = ()
+        br_self_play_episodes = ()
+        br_replay_episodes = ()
+        gc.collect()
         cleanup_completed_round_training_temps(workspace_path, completed_round=round_index - 1)
         pruned_rounds = prune_old_round_directories(
             workspace_path,

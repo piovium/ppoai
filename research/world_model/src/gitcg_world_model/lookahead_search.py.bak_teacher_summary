@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import time
 from dataclasses import dataclass, replace
 from typing import Sequence
@@ -9,8 +8,8 @@ from typing import Sequence
 import torch
 
 from .action_hierarchy import (
+    low_level_kind_for_code,
     match_low_level_code_index,
-    try_low_level_kind_for_code,
 )
 from .decks import SMALL_DECK_MATCHUPS
 from .env import GitcgDecisionEnv
@@ -30,11 +29,6 @@ class LookaheadSearchConfig:
     policy_distill_coef: float = 0.20
     value_distill_coef: float = 0.10
     max_states_per_episode: int = 24
-    # episode: only per-episode summary logs (default)
-    # state: add per-state start/done logs
-    # root: add per-root summary logs
-    # option: full detailed per-option logs
-    trace_level: str = "episode"
 
 
 @dataclass(frozen=True)
@@ -45,21 +39,6 @@ class SearchTeacherTarget:
 
 
 _MATCHUP_BY_KEY = {matchup.key: matchup for matchup in SMALL_DECK_MATCHUPS}
-
-
-_TRACE_LEVEL_ORDER = {"episode": 0, "state": 1, "root": 2, "option": 3}
-
-
-def _normalized_trace_level(config: LookaheadSearchConfig) -> str:
-    value = os.environ.get("SEARCH_TEACHER_TRACE_LEVEL", config.trace_level)
-    level = str(value).strip().lower()
-    return level if level in _TRACE_LEVEL_ORDER else "episode"
-
-
-def _trace_enabled(config: LookaheadSearchConfig, level: str) -> bool:
-    current = _TRACE_LEVEL_ORDER[_normalized_trace_level(config)]
-    wanted = _TRACE_LEVEL_ORDER.get(str(level).strip().lower(), 0)
-    return current >= wanted
 
 
 def annotate_episodes_with_search_targets(
@@ -84,23 +63,21 @@ def annotate_episodes_with_search_targets(
             f"root_top_k={config.root_top_k} depth={config.depth} "
             f"max_states_per_episode={config.max_states_per_episode} "
             f"round_threshold={config.round_threshold} "
-            f"legal_option_threshold={config.legal_option_threshold} "
-            f"trace_level={_normalized_trace_level(config)}"
+            f"legal_option_threshold={config.legal_option_threshold}"
         ),
         flush=True,
     )
     annotated: list[EpisodeRecord] = []
     for episode_index, episode in enumerate(episodes, start=1):
         episode_started_at = time.perf_counter()
-        if _trace_enabled(config, "state"):
-            print(
-                (
-                    "[search-teacher-episode] "
-                    f"{episode_index}/{total_episodes} "
-                    f"matchup={episode.matchup} seed={episode.seed} steps={len(episode.steps)}"
-                ),
-                flush=True,
-            )
+        print(
+            (
+                "[search-teacher-episode] "
+                f"{episode_index}/{total_episodes} "
+                f"matchup={episode.matchup} seed={episode.seed} steps={len(episode.steps)}"
+            ),
+            flush=True,
+        )
         annotated_episode = _annotate_episode(
             episode,
             model=model,
@@ -117,15 +94,14 @@ def annotate_episodes_with_search_targets(
             for step in annotated_episode.steps
             if float(step.metadata.get("search_teacher_weight", 0.0)) > 0.0
         )
-        if _trace_enabled(config, "state"):
-            print(
-                (
-                    "[search-teacher-episode-done] "
-                    f"{episode_index}/{total_episodes} "
-                    f"targets={target_count} elapsed_s={time.perf_counter() - episode_started_at:.2f}"
-                ),
-                flush=True,
-            )
+        print(
+            (
+                "[search-teacher-episode-done] "
+                f"{episode_index}/{total_episodes} "
+                f"targets={target_count} elapsed_s={time.perf_counter() - episode_started_at:.2f}"
+            ),
+            flush=True,
+        )
     print(
         f"[search-teacher] done episodes={total_episodes} elapsed_s={time.perf_counter() - started_at:.2f}",
         flush=True,
@@ -174,8 +150,7 @@ def _annotate_episode(
                 f"budget_left={remaining_budget}"
             )
             state_started_at = time.perf_counter()
-            if _trace_enabled(config, "state"):
-                print(f"[search-teacher-state] {trace_prefix}", flush=True)
+            print(f"[search-teacher-state] {trace_prefix}", flush=True)
             target = _search_teacher_target(
                 step=step,
                 matchup=matchup,
@@ -185,23 +160,22 @@ def _annotate_episode(
                 env_config=env_config,
                 config=config,
                 seed=episode.seed,
-                trace_prefix=(trace_prefix if _trace_enabled(config, "root") else None),
+                trace_prefix=trace_prefix,
             )
             state_elapsed_ms = (time.perf_counter() - state_started_at) * 1000.0
             if target is not None:
                 remaining_budget -= 1
                 annotated_states += 1
-            if _trace_enabled(config, "state"):
-                print(
-                    (
-                        "[search-teacher-state-done] "
-                        f"{trace_prefix} "
-                        f"status={'hit' if target is not None else 'miss'} "
-                        f"elapsed_ms={state_elapsed_ms:.1f} "
-                        f"remaining_budget={remaining_budget}"
-                    ),
-                    flush=True,
-                )
+            print(
+                (
+                    "[search-teacher-state-done] "
+                    f"{trace_prefix} "
+                    f"status={'hit' if target is not None else 'miss'} "
+                    f"elapsed_ms={state_elapsed_ms:.1f} "
+                    f"remaining_budget={remaining_budget}"
+                ),
+                flush=True,
+            )
         if target is None:
             steps.append(step)
             continue
@@ -213,24 +187,12 @@ def _annotate_episode(
     print(
         (
             "[search-teacher-episode-summary] "
-            f"{episode_label} matchup={episode.matchup} seed={episode.seed} "
-            f"considered_states={considered_states} "
+            f"{episode_label} considered_states={considered_states} "
             f"annotated_states={annotated_states} remaining_budget={remaining_budget}"
         ),
         flush=True,
     )
     return replace(episode, steps=tuple(steps))
-
-
-def _legal_action_kind_values_for_step(step: TrajectoryStep) -> tuple[str, ...]:
-    if step.legal_low_level_specs:
-        return tuple(spec.kind.value for spec in step.legal_low_level_specs)
-    kinds: list[str] = []
-    for action_code in step.legal_low_level_codes:
-        kind = try_low_level_kind_for_code(int(action_code))
-        if kind is not None:
-            kinds.append(kind.value)
-    return tuple(kinds)
 
 
 def _is_search_state(step: TrajectoryStep, *, config: LookaheadSearchConfig) -> bool:
@@ -242,11 +204,14 @@ def _is_search_state(step: TrajectoryStep, *, config: LookaheadSearchConfig) -> 
         return True
     if len(step.legal_low_level_codes) >= config.legal_option_threshold:
         return True
-    legal_kind_values = _legal_action_kind_values_for_step(step)
-    if not legal_kind_values:
-        return False
-    productive_non_end = any(kind_value != "action_declare_end" for kind_value in legal_kind_values)
-    has_end = any(kind_value == "action_declare_end" for kind_value in legal_kind_values)
+    productive_non_end = any(
+        low_level_kind_for_code(int(action_code)).value != "action_declare_end"
+        for action_code in step.legal_low_level_codes
+    )
+    has_end = any(
+        low_level_kind_for_code(int(action_code)).value == "action_declare_end"
+        for action_code in step.legal_low_level_codes
+    )
     return productive_non_end and has_end
 
 
@@ -269,7 +234,7 @@ def _search_teacher_target(
         seed=seed,
     )
     if root_context is None or root_context.player_view is None or not root_context.legal_low_level_codes:
-        if trace_prefix is not None and _trace_enabled(config, "root"):
+        if trace_prefix is not None:
             print(f"[search-teacher-root-skip] {trace_prefix} reason=rebuild_failed", flush=True)
         return None
     root_option_indices = _candidate_indices(
@@ -280,10 +245,10 @@ def _search_teacher_target(
         top_k=config.root_top_k,
     )
     if not root_option_indices:
-        if trace_prefix is not None and _trace_enabled(config, "root"):
+        if trace_prefix is not None:
             print(f"[search-teacher-root-skip] {trace_prefix} reason=no_candidates", flush=True)
         return None
-    if trace_prefix is not None and _trace_enabled(config, "root"):
+    if trace_prefix is not None:
         print(
             f"[search-teacher-root] {trace_prefix} root_candidates={len(root_option_indices)}",
             flush=True,
@@ -293,7 +258,7 @@ def _search_teacher_target(
     for option_position, index in enumerate(root_option_indices, start=1):
         root_action_code = int(root_context.legal_low_level_codes[index])
         option_started_at = time.perf_counter()
-        if trace_prefix is not None and _trace_enabled(config, "option"):
+        if trace_prefix is not None:
             print(
                 (
                     "[search-teacher-root-option] "
@@ -313,7 +278,7 @@ def _search_teacher_target(
             depth=config.depth,
             seed=seed,
         )
-        if trace_prefix is not None and _trace_enabled(config, "option"):
+        if trace_prefix is not None:
             print(
                 (
                     "[search-teacher-root-option-done] "
@@ -324,7 +289,7 @@ def _search_teacher_target(
                 flush=True,
             )
     if not score_by_index:
-        if trace_prefix is not None and _trace_enabled(config, "root"):
+        if trace_prefix is not None:
             print(f"[search-teacher-root-skip] {trace_prefix} reason=no_scores", flush=True)
         return None
     base_log_probs = _policy_log_probs(
@@ -339,7 +304,7 @@ def _search_teacher_target(
     policy_target = _softmax_tuple(teacher_logits)
     best_score = max(score_by_index.values())
     teacher_weight = max(config.policy_distill_coef, config.value_distill_coef)
-    if trace_prefix is not None and _trace_enabled(config, "root"):
+    if trace_prefix is not None:
         print(
             (
                 "[search-teacher-root-done] "

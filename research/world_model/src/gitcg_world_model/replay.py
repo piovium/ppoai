@@ -46,8 +46,19 @@ def iter_episode_record_payloads(path: str | Path) -> Iterator[dict[str, Any]]:
             yield json.loads(line)
 
 
-def load_episode_records(path: str | Path) -> list[EpisodeRecord]:
-    return list(iter_episode_records(path))
+def load_episode_records(
+    path: str | Path,
+    *,
+    limit: int | None = None,
+) -> list[EpisodeRecord]:
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    records: list[EpisodeRecord] = []
+    for index, episode in enumerate(iter_episode_records(path), start=1):
+        records.append(episode)
+        if limit is not None and index >= limit:
+            break
+    return records
 
 
 def iter_episode_records(path: str | Path) -> Iterator[EpisodeRecord]:

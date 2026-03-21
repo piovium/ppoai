@@ -9,8 +9,8 @@ from typing import Sequence
 import torch
 
 from .action_hierarchy import (
+    low_level_kind_for_code,
     match_low_level_code_index,
-    try_low_level_kind_for_code,
 )
 from .decks import SMALL_DECK_MATCHUPS
 from .env import GitcgDecisionEnv
@@ -222,17 +222,6 @@ def _annotate_episode(
     return replace(episode, steps=tuple(steps))
 
 
-def _legal_action_kind_values_for_step(step: TrajectoryStep) -> tuple[str, ...]:
-    if step.legal_low_level_specs:
-        return tuple(spec.kind.value for spec in step.legal_low_level_specs)
-    kinds: list[str] = []
-    for action_code in step.legal_low_level_codes:
-        kind = try_low_level_kind_for_code(int(action_code))
-        if kind is not None:
-            kinds.append(kind.value)
-    return tuple(kinds)
-
-
 def _is_search_state(step: TrajectoryStep, *, config: LookaheadSearchConfig) -> bool:
     if step.request_type.name != "ACTION":
         return False
@@ -242,11 +231,14 @@ def _is_search_state(step: TrajectoryStep, *, config: LookaheadSearchConfig) -> 
         return True
     if len(step.legal_low_level_codes) >= config.legal_option_threshold:
         return True
-    legal_kind_values = _legal_action_kind_values_for_step(step)
-    if not legal_kind_values:
-        return False
-    productive_non_end = any(kind_value != "action_declare_end" for kind_value in legal_kind_values)
-    has_end = any(kind_value == "action_declare_end" for kind_value in legal_kind_values)
+    productive_non_end = any(
+        low_level_kind_for_code(int(action_code)).value != "action_declare_end"
+        for action_code in step.legal_low_level_codes
+    )
+    has_end = any(
+        low_level_kind_for_code(int(action_code)).value == "action_declare_end"
+        for action_code in step.legal_low_level_codes
+    )
     return productive_non_end and has_end
 
 

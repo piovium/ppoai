@@ -1,0 +1,143 @@
+diff --git a/research/world_model/src/gitcg_world_model/env.py b/research/world_model/src/gitcg_world_model/env.py
+index 6fbe01f..0000000 100644
+--- a/research/world_model/src/gitcg_world_model/env.py
++++ b/research/world_model/src/gitcg_world_model/env.py
+@@ -110,6 +110,8 @@ class GitcgDecisionEnv:
+         chosen_action_code = int(choice.action_code)
+         if chosen_action_code < 0:
+             chosen_action_code = _fallback_action_code(self._current_context)
++        current_context = self._current_context
++        current_built_context = self._current_built_context
+         self._response_queue.put(chosen_action_code)
+         event = self._next_event()
+         if isinstance(event, _DecisionEvent):
+@@ -122,7 +124,7 @@ class GitcgDecisionEnv:
+         reward = (
+             _terminal_reward(
+                 next_context.full_state.winner,
+-                self._current_context.acting_player,
++                current_context.acting_player,
+                 draw_penalty=self._config.draw_penalty,
+             )
+             if done
+@@ -132,22 +134,22 @@ class GitcgDecisionEnv:
+         normalized_choice = ActionChoice(action_code=chosen_action_code)
+         chosen_low_level_spec = None
+         for candidate_code, candidate_spec in zip(
+-            self._current_context.legal_low_level_codes,
+-            self._current_context.legal_low_level_specs,
++            current_context.legal_low_level_codes,
++            current_context.legal_low_level_specs,
+             strict=False,
+         ):
+             if int(candidate_code) == chosen_action_code:
+                 chosen_low_level_spec = candidate_spec
+                 break
+         trajectory_step = TrajectoryStep(
+-            acting_player=self._current_context.acting_player,
+-            request_type=self._current_context.request_type,
++            acting_player=current_context.acting_player,
++            request_type=current_context.request_type,
+             choice=normalized_choice,
+-            pre_state=self._current_context.full_state,
++            pre_state=current_context.full_state,
+             post_state=terminal_context.full_state,
+             reward=reward,
+             done=done,
+-            legal_low_level_codes=self._current_context.legal_low_level_codes,
+-            legal_low_level_specs=self._current_context.legal_low_level_specs,
+-            legal_low_level_mask=self._current_context.legal_low_level_mask,
+-            legal_high_level_codes=self._current_context.legal_high_level_codes,
+-            high_to_low_map=self._current_context.high_to_low_map,
++            legal_low_level_codes=current_context.legal_low_level_codes,
++            legal_low_level_specs=current_context.legal_low_level_specs,
++            legal_low_level_mask=current_context.legal_low_level_mask,
++            legal_high_level_codes=current_context.legal_high_level_codes,
++            high_to_low_map=current_context.high_to_low_map,
+             chosen_high_level_code=(
+-                self._current_built_context.low_to_high_code.get(chosen_action_code)
+-                if self._current_built_context is not None
++                current_built_context.low_to_high_code.get(chosen_action_code)
++                if current_built_context is not None
+                 else None
+             ),
+             chosen_low_level_spec=chosen_low_level_spec,
+-            player_view=self._current_context.player_view,
+-            full_state_json_before=self._current_context.full_state_json,
++            player_view=current_context.player_view,
++            full_state_json_before=current_context.full_state_json,
+             metadata={
+                 "matchup": self._matchup.key,
+-                "action_label": _action_label(self._current_built_context, chosen_action_code),
++                "action_label": _action_label(current_built_context, chosen_action_code),
+                 **terminal_context.metadata,
+             },
+         )
+diff --git a/research/world_model/src/gitcg_world_model/ppo_training.py b/research/world_model/src/gitcg_world_model/ppo_training.py
+index b1fb347..0000000 100644
+--- a/research/world_model/src/gitcg_world_model/ppo_training.py
++++ b/research/world_model/src/gitcg_world_model/ppo_training.py
+@@ -398,11 +398,11 @@ def _build_player_sequences(
+                     chosen_low_level_code=int(
+                         transition.source_step.choice.action_code
+                         if transition.source_step.choice.action_code >= 0
+                         else encoded.low_level_action_codes[transition.action_index]
+                     ),
+-                    chosen_high_level_code=int(
+-                        transition.source_step.chosen_high_level_code
+-                        if transition.source_step.chosen_high_level_code is not None
+-                        else encoded.low_to_high_codes[transition.action_index]
+-                    ),
++                    chosen_high_level_code=_resolved_chosen_high_level_code(
++                        source_step=transition.source_step,
++                        encoded=encoded,
++                        action_index=transition.action_index,
++                    ),
+                     old_logprob=transition.old_logprob,
+                     return_target=float(return_target),
+                     advantage=float(advantage),
+@@ -751,6 +751,22 @@ def _selected_action_index(step: TrajectoryStep) -> int:
+             return index
+     raise KeyError(f"selected action_code {selected_code} not found in legal low-level codes")
+
++
++def _resolved_chosen_high_level_code(
++    *,
++    source_step: TrajectoryStep,
++    encoded: EncodedObservation,
++    action_index: int,
++) -> int:
++    candidate = source_step.chosen_high_level_code
++    if candidate is not None:
++        resolved = int(candidate)
++        if resolved in {int(code) for code in source_step.legal_high_level_codes}:
++            return resolved
++    if 0 <= int(action_index) < len(encoded.low_to_high_codes):
++        fallback = int(encoded.low_to_high_codes[int(action_index)])
++        if fallback >= 0:
++            return fallback
++    return -1
++
+
+ def _gae_returns(
+     transitions: Sequence[_DecisionTransition],
+@@ -1061,7 +1077,18 @@ def _compute_chunk_batch_loss(
+         step_search_acted = search_acted.index_select(0, loss_indices)[:, step_index] > 0.0
+         current_high_mask = high_level_mask.index_select(0, loss_indices)[:, step_index]
+         step_high_log_probs = masked_log_softmax(output.high_policy_logits[local_indices], current_high_mask)
+         step_high_codes = chosen_high_level_code.index_select(0, loss_indices)[:, step_index]
+-        valid_high = step_high_codes >= 0
++        valid_high = (step_high_codes >= 0) & (step_high_codes < current_high_mask.shape[1])
++        if torch.any(valid_high):
++            legal_high = torch.zeros_like(valid_high)
++            legal_high[valid_high] = torch.gather(
++                current_high_mask[valid_high],
++                1,
++                step_high_codes[valid_high].unsqueeze(-1),
++            ).squeeze(-1)
++            valid_high = legal_high
+         if torch.any(valid_high):
+             selected_high_logprob = torch.gather(
+                 step_high_log_probs[valid_high],
+                 1,
+                 step_high_codes[valid_high].unsqueeze(-1),

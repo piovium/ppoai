@@ -575,11 +575,7 @@ def _build_player_sequences(
                     ),
                     chosen_high_level_code=int(
                         transition.source_step.chosen_high_level_code
-                        if (
-                            transition.source_step.chosen_high_level_code is not None
-                            and int(transition.source_step.chosen_high_level_code)
-                            in {int(code) for code in transition.source_step.legal_high_level_codes}
-                        )
+                        if transition.source_step.chosen_high_level_code is not None
                         else encoded.low_to_high_codes[transition.action_index]
                     ),
                     old_logprob=transition.old_logprob,
@@ -1213,11 +1209,7 @@ def _compute_chunk_batch_loss(
         current_high_mask = high_level_mask.index_select(0, loss_indices)[:, step_index]
         step_high_log_probs = masked_log_softmax(output.high_policy_logits[local_indices], current_high_mask)
         step_high_codes = chosen_high_level_code.index_select(0, loss_indices)[:, step_index]
-        valid_high = (
-            (step_high_codes >= 0)
-            & (step_high_codes < current_high_mask.shape[1])
-            & torch.gather(current_high_mask, 1, step_high_codes.clamp_min(0).unsqueeze(-1)).squeeze(-1)
-        )
+        valid_high = step_high_codes >= 0
         if torch.any(valid_high):
             selected_high_logprob = torch.gather(
                 step_high_log_probs[valid_high],
