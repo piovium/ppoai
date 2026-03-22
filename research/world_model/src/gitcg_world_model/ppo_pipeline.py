@@ -439,18 +439,71 @@ def _run_episode_job(
     max_decisions: int | None,
     job: _EpisodeJob,
 ) -> _EpisodeJobResult:
-    episode = _run_episode(
-        config=config,
-        matchup=job.matchup,
-        agent0=job.agent0_factory(job.seed),
-        agent1=job.agent1_factory(job.seed + 17),
-        seed=job.seed,
-        max_decisions=max_decisions,
-    )
-    if job.metadata:
-        episode = replace(episode, metadata={**episode.metadata, **job.metadata})
-    return _EpisodeJobResult(job=job, episode=episode)
+    requested_seed = job.seed
+    retry_budget = _self_play_retry_limit(job.metadata)
+    attempt = 0
 
+    while True:
+        effective_seed = requested_seed if attempt == 0 else requested_seed + (attempt * _SELF_PLAY_RETRY_SEED_STRIDE)
+        episode = _run_episode(
+            config=config,
+            matchup=job.matchup,
+            agent0=job.agent0_factory(effective_seed),
+            agent1=job.agent1_factory(effective_seed + 17),
+            seed=effective_seed,
+            max_decisions=max_decisions,
+        )
+        merged_metadata = {**episode.metadata, **job.metadata}
+        retry_probe_episode = replace(
+            episode,
+            seed=requested_seed,
+            metadata=merged_metadata,
+        )
+        should_retry, retry_reason = _episode_requires_self_play_retry(retry_probe_episode)
+
+        retry_metadata: dict[str, Any] = {}
+        if attempt > 0:
+            retry_metadata.update(
+                {
+                    "requested_seed": requested_seed,
+                    "actual_seed": effective_seed,
+                    "retry_attempt": attempt,
+                    "resampled_episode": True,
+                }
+            )
+        if retry_reason is not None:
+            retry_metadata["self_play_retry_reason"] = retry_reason
+
+        final_episode = replace(
+            episode,
+            seed=requested_seed,
+            metadata={**merged_metadata, **retry_metadata},
+        )
+
+        if not should_retry:
+            return _EpisodeJobResult(job=job, episode=final_episode)
+
+        if attempt >= retry_budget:
+            exhausted_episode = replace(
+                final_episode,
+                metadata={
+                    **final_episode.metadata,
+                    "retry_exhausted": True,
+                    "retry_budget": retry_budget,
+                },
+            )
+            return _EpisodeJobResult(job=job, episode=exhausted_episode)
+
+        print(
+            "[self-play-retry] "
+            f"matchup={job.matchup.key} "
+            f"seed={requested_seed} "
+            f"actual_seed={effective_seed} "
+            f"attempt={attempt + 1}/{retry_budget} "
+            f"reason={retry_reason}",
+            flush=True,
+        )
+        attempt += 1
 
 def _execute_episode_jobs(
     *,
@@ -1151,6 +1204,64 @@ def _load_recent_p2sro_replay_episodes(
     )
 
 
+_SELF_PLAY_INVALID_TERMINAL_RETRIES_ENV = "GITCG_SELF_PLAY_INVALID_TERMINAL_RETRIES"
+_SELF_PLAY_INVALID_TERMINAL_RETRIES_DEFAULT = 8
+_SELF_PLAY_RETRY_SEED_STRIDE = 1_000_003
+
+
+def _self_play_retry_limit(job_metadata: dict[str, Any]) -> int:
+    if not bool(job_metadata.get("retry_invalid_terminal")):
+        return 0
+    explicit = job_metadata.get("max_invalid_terminal_retries")
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except (TypeError, ValueError):
+            pass
+    raw = os.environ.get(_SELF_PLAY_INVALID_TERMINAL_RETRIES_ENV)
+    if raw is not None:
+        try:
+            return max(0, int(raw.strip()))
+        except ValueError:
+            pass
+    return _SELF_PLAY_INVALID_TERMINAL_RETRIES_DEFAULT
+
+
+def _all_player_characters_defeated(player: Any) -> bool:
+    characters = tuple(getattr(player, "characters", ()) or ())
+    return bool(characters) and all(bool(getattr(character, "defeated", False)) for character in characters)
+
+
+def _episode_requires_self_play_retry(episode: EpisodeRecord) -> tuple[bool, str | None]:
+    metadata = dict(episode.metadata or {})
+    if bool(metadata.get("invalid_terminal")):
+        return True, str(metadata.get("invalid_terminal_reason") or "invalid_terminal")
+    if bool(metadata.get("truncated")):
+        return True, str(metadata.get("truncation_reason") or "truncated_episode")
+
+    final_state = episode.final_state
+    phase = str(getattr(final_state, "phase", "") or "")
+    if phase != "game_end":
+        return True, f"terminal_phase={phase or 'unknown'}"
+
+    players = tuple(getattr(final_state, "players", ()) or ())
+    if len(players) != 2:
+        return False, None
+
+    winner = episode.winner
+    if winner not in (0, 1):
+        return False, None
+
+    player0_all_defeated = _all_player_characters_defeated(players[0])
+    player1_all_defeated = _all_player_characters_defeated(players[1])
+
+    if winner == 0 and player1_all_defeated and not player0_all_defeated:
+        return False, None
+    if winner == 1 and player0_all_defeated and not player1_all_defeated:
+        return False, None
+    return True, f"inconsistent_final_winner={winner}"
+
+
 def collect_bootstrap_episodes(
     *,
     config: EnvConfig,
@@ -1296,6 +1407,7 @@ def collect_p2sro_training_episodes(
                         "opponent_policy_id": opponent_entry.policy_id,
                         "opponent_source": opponent_entry.checkpoint_path,
                         "matchup": matchup.key,
+                        "retry_invalid_terminal": True,
                     },
                 )
             )

@@ -56,6 +56,46 @@ class _SpecPayload:
     payload: dict[str, Any]
 
 
+def _spec_payload_dedup_key(item: _SpecPayload) -> tuple[Any, ...]:
+    spec = item.spec
+    return (
+        spec.request_type.value,
+        spec.kind.value,
+        int(spec.subject_definition_id),
+        tuple((target.owner, target.zone, int(target.index)) for target in spec.target_slots),
+        tuple(int(value) for value in sorted(spec.used_dice)),
+        tuple(int(value) for value in sorted(spec.auto_selected_dice)),
+        int(spec.choose_active_slot),
+        int(spec.select_card_definition_id),
+        int(spec.switch_hand_slot_mask),
+        int(spec.reroll_dice_mask),
+        int(spec.discarded_hand_slot),
+        int(spec.discarded_card_definition_id),
+        int(spec.target_dice),
+    )
+
+
+def _dedupe_spec_payloads(spec_payloads: list[_SpecPayload]) -> tuple[_SpecPayload, ...]:
+    unique: list[_SpecPayload] = []
+    seen: dict[tuple[Any, ...], _SpecPayload] = {}
+    for item in spec_payloads:
+        key = _spec_payload_dedup_key(item)
+        existing = seen.get(key)
+        if existing is not None:
+            if dict(existing.payload) != dict(item.payload):
+                print(
+                    "[action-dedupe] "
+                    f"label={item.spec.label} "
+                    f"first_payload={existing.payload} "
+                    f"second_payload={item.payload}",
+                    flush=True,
+                )
+            continue
+        seen[key] = item
+        unique.append(item)
+    return tuple(unique)
+
+
 def encode_choice(built: BuiltDecisionContext, action_code: int) -> dict[str, Any]:
     if int(action_code) not in built.payload_by_low_level_code:
         raise KeyError(f"unknown action_code: {action_code}")
@@ -88,6 +128,7 @@ def build_decision_context(
         full_state=full_state,
         player_view=player_view,
     )
+    spec_payloads = list(_dedupe_spec_payloads(spec_payloads))
     legality_engine = build_action_legality_engine()
     encoded_actions, materialized_specs, low_to_high_code = legality_engine.encode_legal_actions(
         acting_player=acting_player,
@@ -113,14 +154,25 @@ def build_decision_context(
             legality_engine=legality_engine,
             metadata=metadata,
         )
-    payload_by_low_level_code = {
-        int(spec.action_code): dict(item.payload)
-        for spec, item in zip(materialized_specs, spec_payloads, strict=False)
-    }
-    label_by_low_level_code = {
-        int(spec.action_code): str(spec.label)
-        for spec in materialized_specs
-    }
+    payload_by_low_level_code: dict[int, dict[str, Any]] = {}
+    label_by_low_level_code: dict[int, str] = {}
+    for spec, item in zip(materialized_specs, spec_payloads, strict=False):
+        action_code = int(spec.action_code)
+        payload = dict(item.payload)
+        existing_payload = payload_by_low_level_code.get(action_code)
+        if existing_payload is not None:
+            if existing_payload != payload:
+                print(
+                    "[action-payload-collision] "
+                    f"action_code={action_code} "
+                    f"label={spec.label} "
+                    f"kept_payload={existing_payload} "
+                    f"dropped_payload={payload}",
+                    flush=True,
+                )
+            continue
+        payload_by_low_level_code[action_code] = payload
+        label_by_low_level_code[action_code] = str(spec.label)
     context = DecisionContext(
         acting_player=acting_player,
         request_type=request_type,

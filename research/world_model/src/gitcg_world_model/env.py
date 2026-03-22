@@ -400,6 +400,17 @@ class GitcgDecisionEnv:
                 raw_state_json = final_state_ref.json()
                 final_state = snapshot_state(final_state_ref, state_json=raw_state_json)
                 final_state_json = raw_state_json if self._config.record_full_state_json else None
+                status_name = game.status().name
+                raw_winner = game.winner()
+                error_message = game.error() if status_name == "ABORTED" else None
+                sanitized_winner, invalid_terminal_reason = _validate_terminal_outcome(
+                    final_state,
+                    raw_winner,
+                    status=status_name,
+                    error=error_message,
+                )
+                if sanitized_winner != final_state.winner:
+                    final_state = replace(final_state, winner=sanitized_winner)
                 terminal_context = DecisionContext(
                     acting_player=-1,
                     request_type=DecisionType.TERMINAL,
@@ -415,11 +426,24 @@ class GitcgDecisionEnv:
                     metadata={
                         "matchup": self._matchup.key,
                         "seed": self._seed,
-                        "status": game.status().name,
-                        "winner": game.winner(),
-                        "error": game.error() if game.status().name == "ABORTED" else None,
+                        "status": status_name,
+                        "winner": sanitized_winner,
+                        "raw_winner": raw_winner,
+                        "error": error_message,
+                        "invalid_terminal": bool(invalid_terminal_reason),
+                        "invalid_terminal_reason": invalid_terminal_reason,
                     },
                 )
+                if invalid_terminal_reason:
+                    print(
+                        "[terminal-guard] "
+                        f"matchup={self._matchup.key} "
+                        f"seed={self._seed} "
+                        f"reason={invalid_terminal_reason} "
+                        f"raw_winner={raw_winner} "
+                        f"sanitized_winner={sanitized_winner}",
+                        flush=True,
+                    )
             finally:
                 _safe_release(final_state_ref)
             self._event_queue.put(_TerminalEvent(terminal_context))
@@ -433,6 +457,41 @@ class GitcgDecisionEnv:
             if create_param is not None:
                 _safe_release(create_param)
             gitcg.thread_cleanup()
+
+
+def _validate_terminal_outcome(full_state, winner: int | None, *, status: str | None, error: str | None) -> tuple[int | None, str | None]:
+    players = tuple(getattr(full_state, "players", ()) or ())
+    if len(players) != 2:
+        if status and status != "FINISHED":
+            return None, f"terminal_status={status}"
+        return winner, None
+
+    def _all_defeated(player) -> bool:
+        characters = tuple(getattr(player, "characters", ()) or ())
+        return bool(characters) and all(bool(getattr(ch, "defeated", False)) for ch in characters)
+
+    player0_all_defeated = _all_defeated(players[0])
+    player1_all_defeated = _all_defeated(players[1])
+
+    expected_winner: int | None
+    if player1_all_defeated and not player0_all_defeated:
+        expected_winner = 0
+    elif player0_all_defeated and not player1_all_defeated:
+        expected_winner = 1
+    elif player0_all_defeated and player1_all_defeated:
+        expected_winner = None
+    else:
+        expected_winner = None
+
+    if status and status != "FINISHED":
+        return None, f"terminal_status={status}"
+    if error:
+        return None, f"terminal_error={error}"
+    if winner in (0, 1) and expected_winner is None:
+        return None, f"inconsistent_terminal_winner={winner}"
+    if winner in (0, 1) and expected_winner is not None and int(winner) != int(expected_winner):
+        return None, f"mismatched_terminal_winner={winner}_expected={expected_winner}"
+    return winner, None
 
 
 def _build_create_param(gitcg: Any, config: EnvConfig, matchup: Matchup, seed: int | None):

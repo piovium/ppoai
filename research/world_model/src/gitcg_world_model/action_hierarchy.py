@@ -385,6 +385,11 @@ def semantic_action_key_for_spec(spec: LowLevelActionSpec) -> tuple[Any, ...]:
             tuple((target.owner, target.zone, int(target.index)) for target in spec.target_slots),
         ),
         ("used_dice", tuple(int(value) for value in sorted(spec.used_dice))),
+        ("auto_selected_dice", tuple(int(value) for value in sorted(spec.auto_selected_dice))),
+        ("choose_active_slot", int(spec.choose_active_slot)),
+        ("switch_hand_slot_mask", int(spec.switch_hand_slot_mask)),
+        ("reroll_dice_mask", int(spec.reroll_dice_mask)),
+        ("discarded_hand_slot", int(spec.discarded_hand_slot)),
         ("target_dice", int(spec.target_dice)),
     )
 
