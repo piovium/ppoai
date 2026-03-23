@@ -9,8 +9,11 @@ from typing import Sequence
 import torch
 
 from .action_hierarchy import (
+    legal_low_level_specs,
     match_low_level_code_index,
+    semantic_action_key_for_spec,
     try_low_level_kind_for_code,
+    try_semantic_action_key_for_code,
 )
 from .decks import SMALL_DECK_MATCHUPS
 from .env import GitcgDecisionEnv
@@ -40,6 +43,7 @@ class LookaheadSearchConfig:
 @dataclass(frozen=True)
 class SearchTeacherTarget:
     policy_target: tuple[float, ...]
+    action_semantic_keys: tuple[str, ...]
     value_target: float
     weight: float
 
@@ -48,6 +52,36 @@ _MATCHUP_BY_KEY = {matchup.key: matchup for matchup in SMALL_DECK_MATCHUPS}
 
 
 _TRACE_LEVEL_ORDER = {"episode": 0, "state": 1, "root": 2, "option": 3}
+
+
+def _jsonable_semantic_value(value):
+    if isinstance(value, tuple):
+        return [_jsonable_semantic_value(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable_semantic_value(item) for item in value]
+    return value
+
+
+def _semantic_key_token_for_spec(spec) -> str:
+    import json
+
+    key = semantic_action_key_for_spec(spec)
+    return json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":"))
+
+
+def _semantic_key_tokens_for_context(context: DecisionContext) -> tuple[str, ...]:
+    specs = legal_low_level_specs(context)
+    if specs and len(specs) == len(context.legal_low_level_codes):
+        return tuple(_semantic_key_token_for_spec(spec) for spec in specs)
+    tokens: list[str] = []
+    for code in context.legal_low_level_codes:
+        key = try_semantic_action_key_for_code(int(code))
+        if key is None:
+            tokens.append(f"code:{int(code)}")
+            continue
+        import json
+        tokens.append(json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":")))
+    return tuple(tokens)
 
 
 def _normalized_trace_level(config: LookaheadSearchConfig) -> str:
@@ -207,6 +241,7 @@ def _annotate_episode(
             continue
         metadata = dict(step.metadata)
         metadata["search_teacher_policy"] = list(target.policy_target)
+        metadata["search_teacher_action_semantic_keys"] = list(target.action_semantic_keys)
         metadata["search_teacher_value"] = float(target.value_target)
         metadata["search_teacher_weight"] = float(target.weight)
         steps.append(replace(step, metadata=metadata))
@@ -350,6 +385,7 @@ def _search_teacher_target(
         )
     return SearchTeacherTarget(
         policy_target=policy_target,
+        action_semantic_keys=_semantic_key_tokens_for_context(root_context),
         value_target=float(best_score),
         weight=float(teacher_weight),
     )

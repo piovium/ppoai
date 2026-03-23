@@ -1,0 +1,24 @@
+--- a/research/world_model/src/gitcg_world_model/lookahead_search.py
++++ b/research/world_model/src/gitcg_world_model/lookahead_search.py
+@@ -515,6 +515,21 @@
+ 
+ 
+ 
++def _jsonable_semantic_value(value):
++    if isinstance(value, tuple):
++        return [_jsonable_semantic_value(item) for item in value]
++    if isinstance(value, list):
++        return [_jsonable_semantic_value(item) for item in value]
++    return value
++
++
++def _semantic_key_token_for_code(action_code: int) -> str:
++    import json
++
++    key = semantic_action_key_for_code(int(action_code))
++    return json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":"))
++
++
+ def _softmax_tuple(logits: Sequence[float]) -> tuple[float, ...]:
+     if not logits:
+         return ()

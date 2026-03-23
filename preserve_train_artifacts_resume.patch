@@ -1,0 +1,18 @@
+--- a/research/world_model/src/gitcg_world_model/ppo_pipeline.py
++++ b/research/world_model/src/gitcg_world_model/ppo_pipeline.py
+@@ -914,7 +914,6 @@
+         ),
+         "active_main_slot": (
+             "self_play_analysis.json",
+-            "train",
+             "br_self_play.jsonl",
+             "br_self_play_analysis.json",
+             "br_train",
+@@ -922,7 +921,6 @@
+         ),
+         "active_br_slot": (
+             "br_self_play_analysis.json",
+-            "br_train",
+             "analysis.json",
+         ),
+         "round_finalize": (

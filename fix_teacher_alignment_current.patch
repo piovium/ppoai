@@ -1,0 +1,75 @@
+--- a/research/world_model/src/gitcg_world_model/lookahead_search.py
++++ b/research/world_model/src/gitcg_world_model/lookahead_search.py
+@@ -9,9 +9,11 @@
+ import torch
+ 
+ from .action_hierarchy import (
++    legal_low_level_specs,
+     match_low_level_code_index,
+-    semantic_action_key_for_code,
++    semantic_action_key_for_spec,
+     try_low_level_kind_for_code,
++    try_semantic_action_key_for_code,
+ )
+ from .decks import SMALL_DECK_MATCHUPS
+ from .env import GitcgDecisionEnv
+@@ -50,6 +52,36 @@
+ 
+ 
+ _TRACE_LEVEL_ORDER = {"episode": 0, "state": 1, "root": 2, "option": 3}
++
++
++def _jsonable_semantic_value(value):
++    if isinstance(value, tuple):
++        return [_jsonable_semantic_value(item) for item in value]
++    if isinstance(value, list):
++        return [_jsonable_semantic_value(item) for item in value]
++    return value
++
++
++def _semantic_key_token_for_spec(spec) -> str:
++    import json
++
++    key = semantic_action_key_for_spec(spec)
++    return json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":"))
++
++
++def _semantic_key_tokens_for_context(context: DecisionContext) -> tuple[str, ...]:
++    specs = legal_low_level_specs(context)
++    if specs and len(specs) == len(context.legal_low_level_codes):
++        return tuple(_semantic_key_token_for_spec(spec) for spec in specs)
++    tokens: list[str] = []
++    for code in context.legal_low_level_codes:
++        key = try_semantic_action_key_for_code(int(code))
++        if key is None:
++            tokens.append(f"code:{int(code)}")
++            continue
++        import json
++        tokens.append(json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":")))
++    return tuple(tokens)
+ 
+ 
+ def _normalized_trace_level(config: LookaheadSearchConfig) -> str:
+@@ -353,10 +385,7 @@
+         )
+     return SearchTeacherTarget(
+         policy_target=policy_target,
+-        action_semantic_keys=tuple(
+-            _semantic_key_token_for_code(int(code))
+-            for code in root_context.legal_low_level_codes
+-        ),
++        action_semantic_keys=_semantic_key_tokens_for_context(root_context),
+         value_target=float(best_score),
+         weight=float(teacher_weight),
+     )
+--- a/research/world_model/src/gitcg_world_model/ppo_training.py
++++ b/research/world_model/src/gitcg_world_model/ppo_training.py
+@@ -91,7 +91,7 @@
+         return tuple(0.0 for _ in current_codes)
+ 
+     if teacher_action_semantic_keys is not None and len(teacher_action_semantic_keys) == len(policy):
+-        current_tokens = tuple(_semantic_key_token_for_code(code) for code in current_codes)
++        current_tokens = _semantic_key_tokens_for_context(context)
+         aligned = [0.0] * len(current_codes)
+         index_by_token = {token: index for index, token in enumerate(current_tokens)}
+         for source_index, token in enumerate(teacher_action_semantic_keys):

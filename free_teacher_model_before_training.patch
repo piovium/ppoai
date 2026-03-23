@@ -1,0 +1,29 @@
+--- a/research/world_model/src/gitcg_world_model/ppo_training.py
++++ b/research/world_model/src/gitcg_world_model/ppo_training.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import gc
+ import json
+ import math
+ from contextlib import nullcontext
+@@ -386,6 +387,10 @@
+             env_config=env_config,
+             config=resolved_search_config,
+         )
++        del teacher_model
++        if torch.cuda.is_available() and torch.device(device).type == "cuda":
++            gc.collect()
++            torch.cuda.empty_cache()
+     fresh_chunks = build_ppo_chunks(
+         training_episodes,
+         encoder,
+@@ -1153,7 +1158,7 @@
+         if grad_clip_norm is not None:
+             if scaler is not None and scaler.is_enabled():
+                 scaler.unscale_(optimizer)
+-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
++            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, foreach=False)
+         if scaler is not None and scaler.is_enabled():
+             scaler.step(optimizer)
+             scaler.update()

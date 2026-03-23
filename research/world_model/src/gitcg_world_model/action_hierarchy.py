@@ -442,9 +442,17 @@ def aggregate_high_policy(
     high_dim = high_action_vocab_size()
     aggregated = [0.0] * high_dim
     high_to_low = legal_high_to_low_dict(context)
+    legal_codes = tuple(int(code) for code in context.legal_low_level_codes)
+    if len(low_level_policy) != len(legal_codes):
+        print(
+            "[aggregate-high-policy] "
+            f"length_mismatch policy={len(low_level_policy)} legal={len(legal_codes)}",
+            flush=True,
+        )
+    usable = min(len(low_level_policy), len(legal_codes))
     probability_by_code = {
-        int(code): float(low_level_policy[index])
-        for index, code in enumerate(context.legal_low_level_codes)
+        int(legal_codes[index]): float(low_level_policy[index])
+        for index in range(usable)
     }
     for high_code, low_codes in high_to_low.items():
         aggregated[int(high_code)] = sum(probability_by_code.get(int(code), 0.0) for code in low_codes)

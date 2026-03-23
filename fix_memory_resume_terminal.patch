@@ -1,0 +1,434 @@
+--- a/research/world_model/src/gitcg_world_model/ppo_pipeline.py
++++ b/research/world_model/src/gitcg_world_model/ppo_pipeline.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
++import gc
+ import json
+ import math
++import os
+ import random
+ import shutil
+ import time
+@@ -430,23 +432,153 @@
+     )
+ 
+ 
++
++_EPISODE_RETRY_LIMIT_ENV = "GITCG_EPISODE_RETRY_LIMIT"
++_EPISODE_RETRY_LIMIT_DEFAULT = 8
++_EPISODE_RETRY_SEED_STRIDE = 1_000_003
++
++
++def _episode_retry_limit() -> int:
++    raw = os.environ.get(_EPISODE_RETRY_LIMIT_ENV)
++    if raw is None:
++        return _EPISODE_RETRY_LIMIT_DEFAULT
++    try:
++        return max(0, int(raw.strip()))
++    except ValueError:
++        return _EPISODE_RETRY_LIMIT_DEFAULT
++
++
++def _all_player_characters_defeated(player: Any) -> bool:
++    characters = tuple(getattr(player, "characters", ()) or ())
++    return bool(characters) and all(bool(getattr(character, "defeated", False)) for character in characters)
++
++
++def _episode_retry_reason(*, episode: EpisodeRecord, config: EnvConfig) -> str | None:
++    metadata = dict(episode.metadata or {})
++    if bool(metadata.get("invalid_terminal")):
++        return str(metadata.get("invalid_terminal_reason") or "invalid_terminal")
++    if bool(metadata.get("truncated")):
++        return str(metadata.get("truncation_reason") or "truncated_episode")
++
++    final_state = episode.final_state
++    phase = str(getattr(final_state, "phase", "") or "")
++    if phase != "game_end":
++        return f"terminal_phase={phase or 'unknown'}"
++
++    players = tuple(getattr(final_state, "players", ()) or ())
++    if len(players) != 2:
++        return None
++
++    player0_all_defeated = _all_player_characters_defeated(players[0])
++    player1_all_defeated = _all_player_characters_defeated(players[1])
++    winner = episode.winner
++
++    if winner == 0:
++        if player1_all_defeated and not player0_all_defeated:
++            return None
++        return "inconsistent_final_winner=0"
++    if winner == 1:
++        if player0_all_defeated and not player1_all_defeated:
++            return None
++        return "inconsistent_final_winner=1"
++
++    final_round = int(getattr(final_state, "round_number", 0) or 0)
++    max_rounds = (
++        int(config.max_rounds)
++        if getattr(config, "max_rounds", None) is not None
++        else None
++    )
++    if player0_all_defeated and player1_all_defeated:
++        return None
++    if max_rounds is not None and final_round >= max_rounds:
++        return None
++    return "invalid_draw_without_dual_ko_or_round_cap"
++
++
++def _benchmark_eval_workers(requested_workers: int) -> int:
++    # Selection / payoff evaluation has been the main source of JS heap OOMs.
++    return 1 if requested_workers > 0 else 1
++
++
+ def _run_episode_job(
+     *,
+     config: EnvConfig,
+     max_decisions: int | None,
+     job: _EpisodeJob,
+ ) -> _EpisodeJobResult:
+-    episode = _run_episode(
+-        config=config,
+-        matchup=job.matchup,
+-        agent0=job.agent0_factory(job.seed),
+-        agent1=job.agent1_factory(job.seed + 17),
+-        seed=job.seed,
+-        max_decisions=max_decisions,
+-    )
+-    if job.metadata:
+-        episode = replace(episode, metadata={**episode.metadata, **job.metadata})
+-    return _EpisodeJobResult(job=job, episode=episode)
++    requested_seed = int(job.seed)
++    retry_limit = _episode_retry_limit()
++    for attempt in range(retry_limit + 1):
++        effective_seed = requested_seed + (attempt * _EPISODE_RETRY_SEED_STRIDE)
++        try:
++            episode = _run_episode(
++                config=config,
++                matchup=job.matchup,
++                agent0=job.agent0_factory(effective_seed),
++                agent1=job.agent1_factory(effective_seed + 17),
++                seed=effective_seed,
++                max_decisions=max_decisions,
++            )
++        except Exception as exc:
++            if attempt >= retry_limit:
++                raise
++            print(
++                "[episode-retry] "
++                f"matchup={job.matchup.key} seed={requested_seed} actual_seed={effective_seed} "
++                f"attempt={attempt + 1}/{retry_limit} reason=exception:{type(exc).__name__}",
++                flush=True,
++            )
++            gc.collect()
++            continue
++
++        merged_metadata = {**episode.metadata, **job.metadata} if job.metadata else dict(episode.metadata)
++        retry_reason = _episode_retry_reason(
++            episode=replace(episode, metadata=merged_metadata),
++            config=config,
++        )
++        if retry_reason is None:
++            if attempt > 0:
++                merged_metadata.update(
++                    {
++                        "requested_seed": requested_seed,
++                        "actual_seed": effective_seed,
++                        "retry_attempt": attempt,
++                        "resampled_episode": True,
++                    }
++                )
++            episode = replace(
++                episode,
++                seed=requested_seed,
++                metadata=merged_metadata,
++            )
++            return _EpisodeJobResult(job=job, episode=episode)
++
++        if attempt >= retry_limit:
++            merged_metadata.update(
++                {
++                    "requested_seed": requested_seed,
++                    "actual_seed": effective_seed,
++                    "retry_attempt": attempt,
++                    "retry_exhausted": True,
++                    "retry_reason": retry_reason,
++                }
++            )
++            episode = replace(
++                episode,
++                seed=requested_seed,
++                metadata=merged_metadata,
++            )
++            return _EpisodeJobResult(job=job, episode=episode)
++
++        print(
++            "[episode-retry] "
++            f"matchup={job.matchup.key} seed={requested_seed} actual_seed={effective_seed} "
++            f"attempt={attempt + 1}/{retry_limit} reason={retry_reason}",
++            flush=True,
++        )
++        gc.collect()
++
++    raise RuntimeError("episode retry loop exited unexpectedly")
+ 
+ 
+ def _execute_episode_jobs(
+@@ -457,13 +589,14 @@
+     workers: int,
+     output_path: str | Path | None = None,
+     progress_callback: Callable[[int, int, _EpisodeJobResult], None] | None = None,
++    flush_threshold: int = 8,
+ ) -> tuple[EpisodeRecord, ...]:
+     destination = Path(output_path) if output_path is not None else None
+     total = len(jobs)
+     completed: list[_EpisodeJobResult] = []
+     effective_workers = max(1, workers)
+     pending_episodes: list[EpisodeRecord] = []
+-    flush_threshold = 8
++    flush_threshold = max(1, int(flush_threshold))
+ 
+     def episode_key(*, matchup: str, seed: int | None) -> tuple[str, int | None]:
+         return (matchup, seed)
+@@ -492,6 +625,7 @@
+             return
+         append_episode_records(destination, pending_episodes)
+         pending_episodes = []
++        gc.collect()
+ 
+     completed.sort(key=lambda item: item.job.job_index)
+     if progress_callback is not None:
+@@ -731,6 +865,10 @@
+     )
+     return selected_checkpoint, selected_epoch, selection_summary_path, candidate
+ 
++
++
++def _load_partial_slot_train_artifacts(train_dir: Path) -> PpoTrainArtifacts | None:
++    return load_ppo_train_artifacts(train_dir)
+ 
+ 
+ def _infer_resume_cursor(
+@@ -1043,6 +1181,7 @@
+     inference_server: GpuInferenceServer | None,
+     episodes_per_matchup: int,
+     seed_start: int,
++    output_dir: Path | None = None,
+     progress_callback: Callable[[int, int, EpisodeRecord, str], None] | None = None,
+ ) -> tuple[float, dict[str, float], tuple[dict[str, object], ...]]:
+     per_policy_payoffs: dict[str, float] = {}
+@@ -1098,16 +1237,23 @@
+                         },
+                     )
+                 )
++        eval_output_path = (
++            output_dir / f"{opponent_entry.policy_id}.jsonl"
++            if output_dir is not None
++            else None
++        )
+         episodes = _execute_episode_jobs(
+             config=env_config,
+             jobs=jobs,
+             max_decisions=max_decisions,
+-            workers=workers,
++            workers=_benchmark_eval_workers(workers),
++            output_path=eval_output_path,
+             progress_callback=(
+                 (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                     progress_callback(done, total, result.episode, opponent_policy_id))
+                 if progress_callback is not None else None
+             ),
++            flush_threshold=1,
+         )
+         wins = sum(1 for episode in episodes if episode.winner == 0)
+         losses = sum(1 for episode in episodes if episode.winner == 1)
+@@ -1175,6 +1321,8 @@
+         checkpoint_path = _candidate_checkpoint_path(train_dir, epoch)
+         if not checkpoint_path.exists():
+             raise FileNotFoundError(f"candidate checkpoint missing: {checkpoint_path}")
++        selection_cache_dir = train_dir / "selection_cache" / f"epoch_{epoch:03d}"
++        selection_cache_dir.mkdir(parents=True, exist_ok=True)
+         expected_payoff, per_policy_payoffs, matchup_payloads = _evaluate_checkpoint_against_population(
+             checkpoint_path=checkpoint_path,
+             frozen_population=frozen_population,
+@@ -1188,6 +1336,7 @@
+             inference_server=inference_server,
+             episodes_per_matchup=benchmark_config.episodes_per_matchup,
+             seed_start=seed_start + epoch * 1_000,
++            output_dir=selection_cache_dir,
+             progress_callback=(
+                 (lambda done, total, episode, opponent_policy_id, eval_epoch=epoch:
+                     print_episode_progress(
+@@ -1263,11 +1412,14 @@
+     inference_server: GpuInferenceServer | None,
+     episodes_per_matchup: int,
+     seed_start: int,
++    cache_dir: Path | None = None,
+     round_index: int | None = None,
+     enable_status_print: bool = False,
+ ) -> dict[str, float]:
+     cache: dict[tuple[str, str], tuple[Any, Any]] = {}
+     per_policy_payoffs: dict[str, float] = {}
++    if cache_dir is not None:
++        cache_dir.mkdir(parents=True, exist_ok=True)
+     for opponent_index, opponent_entry in enumerate(manager.frozen_entries()):
+         jobs: list[_EpisodeJob] = []
+         per_matchup_results: list[dict[str, object]] = []
+@@ -1319,11 +1471,17 @@
+                         },
+                     )
+                 )
++        payoff_output_path = (
++            cache_dir / f"{candidate_policy_id}__vs__{opponent_entry.policy_id}.jsonl"
++            if cache_dir is not None
++            else None
++        )
+         episodes = _execute_episode_jobs(
+             config=env_config,
+             jobs=jobs,
+             max_decisions=max_decisions,
+-            workers=workers,
++            workers=_benchmark_eval_workers(workers),
++            output_path=payoff_output_path,
+             progress_callback=(
+                 (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                     print_episode_progress(
+@@ -1336,6 +1494,7 @@
+                     ))
+                 if enable_status_print else None
+             ),
++            flush_threshold=1,
+         )
+         wins = sum(1 for episode in episodes if episode.winner == 0)
+         losses = sum(1 for episode in episodes if episode.winner == 1)
+@@ -1761,12 +1920,13 @@
+         main_phase_total = (len(matchups) * self_play_episodes_per_matchup) + epochs
+         main_phase_artifacts = {"self_play_path": str(self_play_path), "train_dir": str(train_dir)}
+         should_reuse_main_slot = (
+-            _phase_rank(round_resume_phase) > _phase_rank("active_main_slot")
++            _phase_rank(round_resume_phase) >= _phase_rank("active_main_slot")
+             and self_play_path.exists()
+         )
+         main_resume = _load_completed_slot_artifacts(train_dir) if should_reuse_main_slot else None
++        partial_main_train_artifacts = _load_partial_slot_train_artifacts(train_dir) if should_reuse_main_slot else None
+         if manager.active_main_slot is None or manager.active_main_slot.seed_checkpoint_path != str(main_seed_checkpoint):
+-            if main_resume is None:
++            if main_resume is None and partial_main_train_artifacts is None:
+                 seed_entry = manager.initialize_seed_population(
+                     seed_checkpoint_path=str(main_seed_checkpoint),
+                     round_index=round_index,
+@@ -1793,7 +1953,7 @@
+                     parent_policy_id=fallback_seed_policy_id,
+                 )
+                 manager.save()
+-        if main_resume is None:
++        if main_resume is None and partial_main_train_artifacts is None:
+             _persist_phase_state(
+                 working_checkpoint=main_seed_checkpoint,
+                 completed_round=round_index - 1,
+@@ -1914,6 +2074,38 @@
+                     "expected_payoff_vs_meta": selected_main_candidate.expected_payoff_vs_meta,
+                 },
+             )
++        elif partial_main_train_artifacts is not None and main_resume is None:
++            main_train_artifacts = partial_main_train_artifacts
++            self_play_episodes = load_episode_records(self_play_path)
++            self_play_analysis = analyze_episode_records(self_play_episodes, player=0)
++            replay_episodes = _load_recent_p2sro_replay_episodes(
++                workspace_path,
++                current_round=round_index,
++                replay_round_window=3,
++            )
++            selected_main_checkpoint, selected_main_epoch, main_selection_path, selected_main_candidate = _select_active_slot_checkpoint(
++                train_dir=train_dir,
++                train_artifacts=main_train_artifacts,
++                env_config=env_config,
++                matchups=matchups,
++                device=resolved_device,
++                max_decisions=max_decisions,
++                seed_start=seed_start + round_index * 30_000,
++                benchmark_config=resolved_benchmark_config,
++                frozen_population=manager.frozen_entries(),
++                meta_strategy=meta_snapshot,
++                workers=resolved_workers,
++                inference_server=inference_server,
++                enable_status_print=enable_status_print,
++                round_index=round_index,
++            )
++            main_slot_state = manager.update_active_slot_result(
++                slot_name="active_main_slot",
++                selected_epoch=selected_main_epoch,
++                selected_checkpoint_path=str(selected_main_checkpoint),
++                expected_payoff_vs_meta=selected_main_candidate.expected_payoff_vs_meta,
++            )
++            manager.save()
+         else:
+             main_train_artifacts = load_ppo_train_artifacts(train_dir)
+             if main_train_artifacts is None:
+@@ -1947,11 +2139,12 @@
+         br_phase_total = (len(matchups) * self_play_episodes_per_matchup) + epochs
+         br_phase_artifacts = {"self_play_path": str(br_self_play_path), "train_dir": str(br_train_dir)}
+         should_reuse_br_slot = (
+-            _phase_rank(round_resume_phase) > _phase_rank("active_br_slot")
++            _phase_rank(round_resume_phase) >= _phase_rank("active_br_slot")
+             and br_self_play_path.exists()
+         )
+         br_resume = _load_completed_slot_artifacts(br_train_dir) if should_reuse_br_slot else None
+-        if br_resume is None:
++        partial_br_train_artifacts = _load_partial_slot_train_artifacts(br_train_dir) if should_reuse_br_slot else None
++        if br_resume is None and partial_br_train_artifacts is None:
+             _persist_phase_state(
+                 working_checkpoint=selected_main_checkpoint,
+                 completed_round=round_index - 1,
+@@ -2068,6 +2261,34 @@
+                     "expected_payoff_vs_meta": selected_br_candidate.expected_payoff_vs_meta,
+                 },
+             )
++        elif partial_br_train_artifacts is not None and br_resume is None:
++            br_train_artifacts = partial_br_train_artifacts
++            br_self_play_episodes = load_episode_records(br_self_play_path)
++            br_self_play_analysis = analyze_episode_records(br_self_play_episodes, player=0)
++            br_replay_episodes = tuple(replay_episodes) + tuple(self_play_episodes)
++            selected_br_checkpoint, selected_br_epoch, br_selection_path, selected_br_candidate = _select_active_slot_checkpoint(
++                train_dir=br_train_dir,
++                train_artifacts=br_train_artifacts,
++                env_config=env_config,
++                matchups=matchups,
++                device=resolved_device,
++                max_decisions=max_decisions,
++                seed_start=seed_start + round_index * 40_000,
++                benchmark_config=resolved_benchmark_config,
++                frozen_population=manager.frozen_entries(),
++                meta_strategy=meta_snapshot,
++                workers=resolved_workers,
++                inference_server=inference_server,
++                enable_status_print=enable_status_print,
++                round_index=round_index,
++            )
++            br_slot_state = manager.update_active_slot_result(
++                slot_name="active_br_slot",
++                selected_epoch=selected_br_epoch,
++                selected_checkpoint_path=str(selected_br_checkpoint),
++                expected_payoff_vs_meta=selected_br_candidate.expected_payoff_vs_meta,
++            )
++            manager.save()
+         else:
+             br_train_artifacts = load_ppo_train_artifacts(br_train_dir)
+             if br_train_artifacts is None:
+@@ -2107,6 +2328,7 @@
+                 inference_server=inference_server,
+                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
+                 seed_start=seed_start + round_index * 50_000,
++                cache_dir=round_dir / "payoff_cache",
+                 round_index=round_index,
+                 enable_status_print=enable_status_print,
+             )
+@@ -2128,6 +2350,7 @@
+                 inference_server=inference_server,
+                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
+                 seed_start=seed_start + round_index * 60_000,
++                cache_dir=round_dir / "payoff_cache",
+                 round_index=round_index,
+                 enable_status_print=enable_status_print,
+             )

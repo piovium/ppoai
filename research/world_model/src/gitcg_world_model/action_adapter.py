@@ -82,14 +82,9 @@ def _dedupe_spec_payloads(spec_payloads: list[_SpecPayload]) -> tuple[_SpecPaylo
         key = _spec_payload_dedup_key(item)
         existing = seen.get(key)
         if existing is not None:
-            if dict(existing.payload) != dict(item.payload):
-                print(
-                    "[action-dedupe] "
-                    f"label={item.spec.label} "
-                    f"first_payload={existing.payload} "
-                    f"second_payload={item.payload}",
-                    flush=True,
-                )
+            # Benign duplicate raw options are common (for example identical card
+            # copies / equivalent tuning branches). Keep the first payload silently
+            # to avoid flooding stdout with index-only dedupe noise.
             continue
         seen[key] = item
         unique.append(item)

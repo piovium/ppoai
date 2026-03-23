@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 from contextlib import nullcontext
@@ -20,6 +21,8 @@ from .action_hierarchy import (
     high_action_vocab_size,
     legal_low_level_specs,
     selected_low_level_code,
+    semantic_action_key_for_spec,
+    try_semantic_action_key_for_code,
 )
 from .lookahead_search import LookaheadSearchConfig, annotate_episodes_with_search_targets
 from .public_state import PublicStateTracker
@@ -40,6 +43,82 @@ from .sepot_search import (
     state_search_context_summary,
 )
 from .schema import DecisionContext, EnvConfig, EpisodeRecord, TrajectoryStep
+
+
+def _jsonable_semantic_value(value):
+    if isinstance(value, tuple):
+        return [_jsonable_semantic_value(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable_semantic_value(item) for item in value]
+    return value
+
+
+def _semantic_key_token_for_spec(spec) -> str:
+    key = semantic_action_key_for_spec(spec)
+    return json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":"))
+
+
+def _semantic_key_tokens_for_context(context: DecisionContext) -> tuple[str, ...]:
+    specs = legal_low_level_specs(context)
+    if specs and len(specs) == len(context.legal_low_level_codes):
+        return tuple(_semantic_key_token_for_spec(spec) for spec in specs)
+    tokens: list[str] = []
+    for code in context.legal_low_level_codes:
+        key = try_semantic_action_key_for_code(int(code))
+        if key is None:
+            tokens.append(f"code:{int(code)}")
+            continue
+        tokens.append(json.dumps(_jsonable_semantic_value(key), ensure_ascii=False, separators=(",", ":")))
+    return tuple(tokens)
+
+
+def _normalize_policy(values: Sequence[float]) -> tuple[float, ...]:
+    total = sum(max(0.0, float(value)) for value in values)
+    if total <= 1.0e-8:
+        return tuple(0.0 for _ in values)
+    return tuple(max(0.0, float(value)) / total for value in values)
+
+
+def _align_search_teacher_policy_target(
+    *,
+    context: DecisionContext,
+    policy: Sequence[float],
+    teacher_action_semantic_keys: Sequence[str] | None = None,
+) -> tuple[float, ...]:
+    current_codes = tuple(int(code) for code in context.legal_low_level_codes)
+    if not current_codes:
+        return ()
+    if not policy:
+        return tuple(0.0 for _ in current_codes)
+
+    if teacher_action_semantic_keys is not None and len(teacher_action_semantic_keys) == len(policy):
+        current_tokens = _semantic_key_tokens_for_context(context)
+        aligned = [0.0] * len(current_codes)
+        index_by_token = {token: index for index, token in enumerate(current_tokens)}
+        for source_index, token in enumerate(teacher_action_semantic_keys):
+            target_index = index_by_token.get(str(token))
+            if target_index is None:
+                continue
+            aligned[target_index] += float(policy[source_index])
+        normalized = _normalize_policy(aligned)
+        if any(value > 0.0 for value in normalized):
+            return normalized
+        print(
+            "[search-teacher-align] "
+            f"status=drop_all_unmatched semantic current={len(current_codes)} teacher={len(policy)}",
+            flush=True,
+        )
+        return tuple(0.0 for _ in current_codes)
+
+    if len(policy) == len(current_codes):
+        return _normalize_policy(tuple(float(value) for value in policy))
+
+    print(
+        "[search-teacher-align] "
+        f"status=length_mismatch current={len(current_codes)} teacher={len(policy)}",
+        flush=True,
+    )
+    return tuple(0.0 for _ in current_codes)
 
 
 @dataclass(frozen=True)
@@ -308,6 +387,10 @@ def train_ppo_from_episodes(
             env_config=env_config,
             config=resolved_search_config,
         )
+        del teacher_model
+        if torch.cuda.is_available() and torch.device(device).type == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
     fresh_chunks = build_ppo_chunks(
         training_episodes,
         encoder,
@@ -551,8 +634,21 @@ def _build_player_sequences(
         for transition, return_target, advantage in zip(transitions, returns, advantages):
             encoded = transition.encoded
             transition_context = _context_from_step(transition.source_step, episode_metadata=episode.metadata)
-            search_teacher_policy_target = tuple(
+            raw_search_teacher_policy_target = tuple(
                 float(value) for value in transition.source_step.metadata.get("search_teacher_policy", ())
+            )
+            raw_search_teacher_action_semantic_keys = tuple(
+                str(value)
+                for value in transition.source_step.metadata.get("search_teacher_action_semantic_keys", ())
+            )
+            search_teacher_policy_target = _align_search_teacher_policy_target(
+                context=transition_context,
+                policy=raw_search_teacher_policy_target,
+                teacher_action_semantic_keys=(
+                    raw_search_teacher_action_semantic_keys
+                    if raw_search_teacher_action_semantic_keys
+                    else None
+                ),
             )
             result[player].append(
                 PpoTrainSample(
@@ -1062,7 +1158,7 @@ def _run_training_epoch(
         if grad_clip_norm is not None:
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, foreach=False)
         if scaler is not None and scaler.is_enabled():
             scaler.step(optimizer)
             scaler.update()
