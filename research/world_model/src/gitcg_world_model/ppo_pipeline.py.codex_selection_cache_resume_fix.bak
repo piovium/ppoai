@@ -57,7 +57,6 @@ from .managed_loop_utils import (
 )
 from .replay import (
     append_episode_records,
-    deserialize_episode_record,
     iter_episode_record_payloads,
     iter_episode_records,
     load_episode_records,
@@ -593,41 +592,10 @@ def _append_benchmark_cache_episodes(path: Path, episodes: Sequence[EpisodeRecor
 def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
     source = Path(path)
     cached: list[EpisodeRecord] = []
-    if not source.exists():
-        return cached
-    with source.open("r", encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                if not raw_line.endswith("\n"):
-                    print(
-                        "[benchmark-cache-warning] "
-                        f"path={source} line={line_number} reason=truncated_tail_record skipped=True",
-                        flush=True,
-                    )
-                    break
-                raise ValueError(
-                    f"Malformed benchmark cache record at {source}:{line_number}"
-                ) from exc
-            try:
-                if payload.get("_wm_cache_format") == _BENCHMARK_CACHE_FORMAT:
-                    cached.append(_deserialize_benchmark_cache_episode(payload))
-                    continue
-                if "final_state" in payload:
-                    cached.append(deserialize_episode_record(payload))
-                    continue
-            except Exception as exc:
-                raise ValueError(
-                    f"Failed to deserialize benchmark cache record at {source}:{line_number}"
-                ) from exc
-            raise ValueError(
-                f"Unsupported benchmark cache record at {source}:{line_number} "
-                f"keys={sorted(payload.keys())}"
-            )
+    for payload in iter_episode_record_payloads(source):
+        if payload.get("_wm_cache_format") != _BENCHMARK_CACHE_FORMAT:
+            return load_episode_records(source)
+        cached.append(_deserialize_benchmark_cache_episode(payload))
     return cached
 
 

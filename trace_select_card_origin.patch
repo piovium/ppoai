@@ -1,0 +1,83 @@
+diff --git a/research/world_model/src/gitcg_world_model/action_adapter.py b/research/world_model/src/gitcg_world_model/action_adapter.py
+index 0000000..patched 100644
+--- a/research/world_model/src/gitcg_world_model/action_adapter.py
++++ b/research/world_model/src/gitcg_world_model/action_adapter.py
+@@ -91,9 +91,41 @@ def _dedupe_spec_payloads(spec_payloads: list[_SpecPayload]) -> tuple[_SpecPaylo
+     return tuple(unique)
+
+
++def _should_trace_select_card_value(value: Any) -> bool:
++    if isinstance(value, bool):
++        return False
++    if isinstance(value, int):
++        return False
++    if isinstance(value, float):
++        return not value.is_integer()
++    text = repr(value)
++    return "." in text or not text.lstrip("-").isdigit()
++
++
++def _trace_select_card_candidates(*, stage: str, candidates: list[Any], extra: str = "") -> None:
++    if not any(_should_trace_select_card_value(value) for value in candidates):
++        return
++    rendered = ", ".join(
++        f"{value!r}:{type(value).__name__}"
++        for value in candidates
++    )
++    suffix = f" {extra}" if extra else ""
++    print(
++        f"[select-card-trace] stage={stage} candidates=[{rendered}]{suffix}",
++        flush=True,
++    )
++
++
+ def encode_choice(built: BuiltDecisionContext, action_code: int) -> dict[str, Any]:
+     if int(action_code) not in built.payload_by_low_level_code:
+         raise KeyError(f"unknown action_code: {action_code}")
+-    return dict(built.payload_by_low_level_code[int(action_code)])
++    payload = dict(built.payload_by_low_level_code[int(action_code)])
++    if built.context.request_type == DecisionType.SELECT_CARD:
++        selected_definition_id = payload.get("selected_definition_id")
++        if _should_trace_select_card_value(selected_definition_id):
++            label = built.label_by_low_level_code.get(int(action_code), f"action:{action_code}")
++            print(
++                f"[select-card-trace] stage=encode_choice selected_definition_id={selected_definition_id!r}:{type(selected_definition_id).__name__} "
++                f"action_code={int(action_code)} label={label}",
++                flush=True,
++            )
++    return payload
+
+
+ def build_decision_context(
+@@ -353,6 +385,7 @@ def _select_card_specs(**kwargs):
+     request = kwargs["request"]
++    _trace_select_card_candidates(stage="action_adapter.request", candidates=list(request.candidate_definition_ids))
+     specs = [
+         _SpecPayload(
+             spec=LowLevelActionSpec(
+diff --git a/research/world_model/src/gitcg_world_model/env.py b/research/world_model/src/gitcg_world_model/env.py
+index 0000000..patched 100644
+--- a/research/world_model/src/gitcg_world_model/env.py
++++ b/research/world_model/src/gitcg_world_model/env.py
+@@ -248,6 +248,20 @@ class GitcgDecisionEnv:
+                     if self.last_notification is not None:
+                         visible_snapshot = snapshot_notification(self.last_notification)
++                    if request_type == DecisionType.SELECT_CARD:
++                        raw_candidates = list(getattr(request, "candidate_definition_ids", ()))
++                        if any(
++                            (
++                                isinstance(value, float) and not value.is_integer()
++                            ) or (
++                                not isinstance(value, (int, bool, float))
++                            )
++                            for value in raw_candidates
++                        ):
++                            print(
++                                "[select-card-trace] "
++                                f"stage=env.request matchup={env._matchup.key} seed={env._seed} player={self.who} "
++                                f"step={step_index_ref['value']} candidates={[repr(v) + ':' + type(v).__name__ for v in raw_candidates]}",
++                                flush=True,
++                            )
+                     built_context = build_decision_context(
+                         acting_player=self.who,
+                         request_type=request_type,

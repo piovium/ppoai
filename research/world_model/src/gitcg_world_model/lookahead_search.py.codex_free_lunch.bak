@@ -307,14 +307,11 @@ def _search_teacher_target(
         if trace_prefix is not None and _trace_enabled(config, "root"):
             print(f"[search-teacher-root-skip] {trace_prefix} reason=rebuild_failed", flush=True)
         return None
-    base_log_probs = _policy_log_probs(
+    root_option_indices = _candidate_indices(
         context=root_context,
         model=model,
         encoder=encoder,
         device=device,
-    )
-    root_option_indices = _top_candidate_indices(
-        base_log_probs,
         top_k=config.root_top_k,
     )
     if not root_option_indices:
@@ -365,6 +362,12 @@ def _search_teacher_target(
         if trace_prefix is not None and _trace_enabled(config, "root"):
             print(f"[search-teacher-root-skip] {trace_prefix} reason=no_scores", flush=True)
         return None
+    base_log_probs = _policy_log_probs(
+        context=root_context,
+        model=model,
+        encoder=encoder,
+        device=device,
+    )
     teacher_logits = list(base_log_probs)
     for index, score in score_by_index.items():
         teacher_logits[index] = float(score) / max(1e-6, config.policy_temperature)
@@ -455,12 +458,6 @@ def _candidate_indices(
     if not context.legal_low_level_codes:
         return ()
     log_probs = _policy_log_probs(context=context, model=model, encoder=encoder, device=device)
-    return _top_candidate_indices(log_probs, top_k=top_k)
-
-
-def _top_candidate_indices(log_probs: Sequence[float], *, top_k: int) -> tuple[int, ...]:
-    if not log_probs:
-        return ()
     ranked = sorted(range(len(log_probs)), key=lambda index: log_probs[index], reverse=True)
     limit = max(1, min(len(ranked), int(top_k)))
     return tuple(ranked[:limit])

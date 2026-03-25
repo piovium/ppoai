@@ -388,8 +388,8 @@ def train_ppo_from_episodes(
             config=resolved_search_config,
         )
         del teacher_model
+        gc.collect()
         if torch.cuda.is_available() and torch.device(device).type == "cuda":
-            gc.collect()
             torch.cuda.empty_cache()
     fresh_chunks = build_ppo_chunks(
         training_episodes,

@@ -26,7 +26,6 @@ from gitcg_world_model.ppo_pipeline import (
     _shortlist_candidate_epochs,
     run_ppo_managed_loop,
 )
-from gitcg_world_model.replay import append_episode_records
 from gitcg_world_model.schema import EnvConfig, EpisodeRecord, PlayerSnapshot, StateSnapshot
 
 
@@ -292,44 +291,6 @@ class PpoPipelineTests(unittest.TestCase):
         self.assertEqual(runner.call_count, 2)
         self.assertEqual(tuple(item.seed for item in episodes), (0, 1, 2))
         self.assertEqual(tuple(item.seed for item in cached), (0, 1, 2))
-
-    def test_load_benchmark_cache_episodes_supports_mixed_full_and_compact_records(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_path = Path(temp_dir) / "mixed_benchmark_cache.jsonl"
-            append_episode_records(
-                output_path,
-                [
-                    _dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=0),
-                    _dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=1),
-                ],
-            )
-            _append_benchmark_cache_episodes(
-                output_path,
-                [
-                    _dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=2),
-                    _dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=3),
-                ],
-            )
-
-            cached = _load_benchmark_cache_episodes(output_path)
-
-        self.assertEqual(tuple(item.seed for item in cached), (0, 1, 2, 3))
-        self.assertEqual(cached[0].final_state.phase, "test")
-        self.assertEqual(cached[2].final_state.phase, "benchmark_cache")
-
-    def test_load_benchmark_cache_episodes_ignores_truncated_tail_record(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_path = Path(temp_dir) / "truncated_benchmark_cache.jsonl"
-            _append_benchmark_cache_episodes(
-                output_path,
-                [_dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=0)],
-            )
-            with output_path.open("a", encoding="utf-8") as handle:
-                handle.write('{"_wm_cache_format":"benchmark_episode_summary_v1"')
-
-            cached = _load_benchmark_cache_episodes(output_path)
-
-        self.assertEqual(tuple(item.seed for item in cached), (0,))
 
     def test_benchmark_eval_workers_uses_safe_default_cap_and_env_override(self):
         with patch.dict(os.environ, {}, clear=False):

@@ -1189,9 +1189,7 @@ class SePotSearchController:
                 return self._rollout_value(
                     env=env,
                     current_context=next_context,
-                    current_sampled_state_json=(
-                        next_context.full_state_json if next_context is not None else None
-                    ),
+                    current_sampled_state_json=next_context.full_state_json,
                     current_public_belief=update_result.updated_public_belief,
                     current_history=branch_history,
                     root_player=root_public_belief.root_player,
@@ -1362,9 +1360,7 @@ class SePotSearchController:
             return self._rollout_value(
                 env=env,
                 current_context=next_context,
-                current_sampled_state_json=(
-                    next_context.full_state_json if next_context is not None else None
-                ),
+                current_sampled_state_json=next_context.full_state_json,
                 current_public_belief=update_result.updated_public_belief,
                 current_history=current_history,
                 root_player=root_player,
@@ -1589,9 +1585,7 @@ class SePotSearchController:
             return self._rollout_value(
                 env=child_env,
                 current_context=next_context,
-                current_sampled_state_json=(
-                    next_context.full_state_json if next_context is not None else None
-                ),
+                current_sampled_state_json=next_context.full_state_json,
                 current_public_belief=update_result.updated_public_belief,
                 current_history=child_history,
                 root_player=root_player,

@@ -1,0 +1,451 @@
+diff --git a/research/world_model/src/gitcg_world_model/env.py b/research/world_model/src/gitcg_world_model/env.py
+index fc65220..stateprobe 100644
+--- a/research/world_model/src/gitcg_world_model/env.py
++++ b/research/world_model/src/gitcg_world_model/env.py
+@@ -1,11 +1,9 @@
+ from __future__ import annotations
+
+ import os
+ import traceback
+ import json
+-import time
+ from dataclasses import dataclass, replace
+ from importlib import import_module
+ from queue import Empty, Queue
+-from collections import deque
+ from threading import Event, Thread
+ from typing import Any
+
+@@ -73,35 +71,40 @@ def _patch_gitcg_instance_callback_storage(gitcg: Any) -> None:
+     game_cls.set_player = _instance_safe_set_player
+     game_cls._world_model_instance_callback_patch = True
+
++_STATE_TRACE_PATH_ENV = "GITCG_STATE_TRACE_PATH"
++_STATE_TRACE_DEFAULT = "gitcg_state_probe.jsonl"
++_STATE_FOCUS_TOKENS = ("116092", "116092.02", "116096", "116093")
+
+-_TRACE_LOG_PATH_ENV = "GITCG_IO_TRACE_PATH"
+-_TRACE_LOG_DEFAULT = "gitcg_io_trace.jsonl"
+
+-
+-def _trace_log_path() -> str:
+-    configured = os.environ.get(_TRACE_LOG_PATH_ENV)
++def _state_trace_path() -> str:
++    configured = os.environ.get(_STATE_TRACE_PATH_ENV)
+     if configured and configured.strip():
+         return configured.strip()
+-    return os.path.join(os.getcwd(), _TRACE_LOG_DEFAULT)
++    return os.path.join(os.getcwd(), _STATE_TRACE_DEFAULT)
+
+
+-def _json_safe(value: Any):
+-    if value is None or isinstance(value, (str, int, float, bool)):
+-        return value
+-    if isinstance(value, (list, tuple)):
+-        return [_json_safe(item) for item in value]
+-    if isinstance(value, dict):
+-        return {str(key): _json_safe(val) for key, val in value.items()}
+-    return repr(value)
++def _find_snippets(text: str, token: str, *, radius: int = 140, limit: int = 2) -> list[str]:
++    snippets: list[str] = []
++    start = 0
++    while len(snippets) < limit:
++        index = text.find(token, start)
++        if index < 0:
++            break
++        left = max(0, index - radius)
++        right = min(len(text), index + len(token) + radius)
++        snippets.append(text[left:right].replace("\n", " "))
++        start = index + len(token)
++    return snippets
+
+
+-def _append_trace_event(event: dict[str, Any]) -> None:
+-    try:
+-        payload = dict(event)
+-        payload.setdefault("ts", time.time())
+-        path = _trace_log_path()
+-        with open(path, "a", encoding="utf-8") as handle:
+-            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
+-    except Exception:
+-        pass
++def _state_focus(raw_state_json: str | None) -> dict[str, Any]:
++    text = raw_state_json or ""
++    focus: dict[str, Any] = {
++        "length": len(text),
++        "contains_116092": "116092" in text,
++        "contains_116092_dot": "116092.02" in text,
++    }
++    for token in _STATE_FOCUS_TOKENS:
++        snippets = _find_snippets(text, token)
++        if snippets:
++            focus[f"snippets_{token.replace('.', '_')}"] = snippets
++    return focus
+
+
+ def _state_brief(full_state: Any) -> dict[str, Any]:
+@@ -111,6 +114,13 @@ def _state_brief(full_state: Any) -> dict[str, Any]:
+         "current_turn": getattr(full_state, "current_turn", None),
+         "winner": getattr(full_state, "winner", None),
+     }
++
++
++def _append_state_probe(event: dict[str, Any]) -> None:
++    try:
++        with open(_state_trace_path(), "a", encoding="utf-8") as handle:
++            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
++    except Exception:
++        pass
+
+
+ class _EnvironmentClosed(RuntimeError):
+@@ -153,6 +163,7 @@ class GitcgDecisionEnv:
+         self._terminal_context: DecisionContext | None = None
+         self._steps: list[TrajectoryStep] = []
+         self._seed: int | None = None
++        self._reset_state_probe_written = False
+
+     def reset(self, seed: int | None = None, *, state_json: str | None = None) -> DecisionContext:
+         self.close()
+@@ -164,12 +175,24 @@ class GitcgDecisionEnv:
+         self._steps = []
+         self._seed = seed if seed is not None else self._config.seed
+         initial_state_json = state_json if state_json is not None else self._initial_state_json
++        self._reset_state_probe_written = False
+         self._worker = Thread(
+             target=self._run_worker,
+             args=(self._seed, initial_state_json),
+             daemon=True,
+             name=f"gitcg-world-model-{self._matchup.key}",
+         )
++        if initial_state_json is not None and not self._reset_state_probe_written:
++            _append_state_probe(
++                {
++                    "kind": "reset_state_json",
++                    "matchup": self._matchup.key,
++                    "seed": self._seed,
++                    "focus": _state_focus(initial_state_json),
++                }
++            )
++            self._reset_state_probe_written = True
+         self._worker.start()
+         event = self._next_event()
+         if isinstance(event, _DecisionEvent):
+@@ -305,34 +328,10 @@ class GitcgDecisionEnv:
+                 def __init__(self, who: int):
+                     self.who = who
+                     self.last_notification = None
+-                    self.last_error: str | None = None
+-                    self.last_request_type: str | None = None
+-                    self.last_request_summary: str | None = None
+-                    self.last_response_payload: dict[str, Any] | None = None
+-                    self.trace_buffer: deque[dict[str, Any]] = deque(maxlen=32)
+-
+-                def _push_trace(self, event: dict[str, Any]) -> None:
+-                    self.trace_buffer.append(dict(event))
+-                    _append_trace_event(event)
++                    self.last_error: str | None = None
+
+                 def on_notify(self, notification):
+                     self.last_notification = notification
+
+                 def on_io_error(self, error_msg: str):
+                     self.last_error = error_msg
+-                    event = {
+-                        "kind": "io_error",
+-                        "matchup": env._matchup.key,
+-                        "seed": env._seed,
+-                        "player": self.who,
+-                        "request_type": self.last_request_type,
+-                        "request_summary": self.last_request_summary,
+-                        "response_payload": self.last_response_payload,
+-                        "error": error_msg,
+-                        "recent_trace": list(self.trace_buffer),
+-                    }
+-                    self._push_trace(event)
+-                    print(
+-                        "[io-error-file] "
+-                        f"path={_trace_log_path()} matchup={env._matchup.key} seed={env._seed} player={self.who}",
+-                        flush=True,
+-                    )
+
+                 def on_choose_active(self, request):
+                     payload = self._await_payload(DecisionType.CHOOSE_ACTIVE, request)
+@@ -352,62 +351,6 @@ class GitcgDecisionEnv:
+                 def on_action(self, request):
+                     payload = self._await_payload(DecisionType.ACTION, request)
+                     return gitcg.ActionResponse(**payload)
+-
+-                def _request_summary(self, request_type: DecisionType, request: Any) -> str:
+-                    if request_type == DecisionType.SELECT_CARD:
+-                        values = list(getattr(request, "candidate_definition_ids", ()))
+-                        typed = [f"{value!r}:{type(value).__name__}" for value in values]
+-                        return f"candidate_definition_ids={typed}"
+-                    if request_type == DecisionType.CHOOSE_ACTIVE:
+-                        values = list(getattr(request, "candidate_ids", ()))
+-                        typed = [f"{value!r}:{type(value).__name__}" for value in values]
+-                        return f"candidate_ids={typed}"
+-                    if request_type == DecisionType.SWITCH_HANDS:
+-                        removed = list(getattr(request, "candidate_hand_ids", ()))
+-                        typed = [f"{value!r}:{type(value).__name__}" for value in removed]
+-                        return f"candidate_hand_ids={typed}"
+-                    if request_type == DecisionType.REROLL_DICE:
+-                        return f"dice_count={len(list(getattr(request, 'dice', ()) or []))}"
+-                    if request_type == DecisionType.ACTION:
+-                        actions = list(getattr(request, "action", ()))
+-                        rendered: list[str] = []
+-                        for index, action in enumerate(actions):
+-                            if action.HasField("play_card"):
+-                                rendered.append(f"{index}:play_card:{getattr(action.play_card, 'card_definition_id', None)!r}")
+-                            elif action.HasField("use_skill"):
+-                                rendered.append(f"{index}:use_skill:{getattr(action.use_skill, 'skill_definition_id', None)!r}")
+-                            elif action.HasField("elemental_tuning"):
+-                                rendered.append(f"{index}:elemental_tuning:{getattr(action.elemental_tuning, 'discarded_card_definition_id', None)!r}")
+-                            elif action.HasField("switch_active"):
+-                                rendered.append(f"{index}:switch_active:{getattr(action.switch_active, 'active_character_id', None)!r}")
+-                            elif action.HasField("declare_end"):
+-                                rendered.append(f"{index}:declare_end")
+-                        return f"actions={rendered}"
+-                    return repr(request)
+
+                 def _await_payload(self, request_type: DecisionType, request: Any) -> dict[str, Any]:
+-                    def _request_summary(request_type: DecisionType, request: Any) -> str:
+-                        if request_type == DecisionType.SELECT_CARD:
+-                            values = list(getattr(request, "candidate_definition_ids", ()))
+-                            typed = [f"{value!r}:{type(value).__name__}" for value in values]
+-                            return f"candidate_definition_ids={typed}"
+-                        if request_type == DecisionType.CHOOSE_ACTIVE:
+-                            values = list(getattr(request, "candidate_ids", ()))
+-                            typed = [f"{value!r}:{type(value).__name__}" for value in values]
+-                            return f"candidate_ids={typed}"
+-                        if request_type == DecisionType.SWITCH_HANDS:
+-                            values = list(getattr(request, "candidate_hand_ids", ()))
+-                            typed = [f"{value!r}:{type(value).__name__}" for value in values]
+-                            return f"candidate_hand_ids={typed}"
+-                        if request_type == DecisionType.REROLL_DICE:
+-                            return f"dice_count={len(list(getattr(request, 'dice', ())))}"
+-                        if request_type == DecisionType.ACTION:
+-                            actions = list(getattr(request, "action", ()))
+-                            rendered: list[str] = []
+-                            for index, action in enumerate(actions):
+-                                kind = "unknown"
+-                                if action.HasField("play_card"):
+-                                    definition_id = getattr(action.play_card, "card_definition_id", None)
+-                                    kind = f"play_card:{definition_id!r}:{type(definition_id).__name__}"
+-                                elif action.HasField("use_skill"):
+-                                    definition_id = getattr(action.use_skill, "skill_definition_id", None)
+-                                    kind = f"use_skill:{definition_id!r}:{type(definition_id).__name__}"
+-                                elif action.HasField("elemental_tuning"):
+-                                    definition_id = getattr(
+-                                        action.elemental_tuning,
+-                                        "discarded_card_definition_id",
+-                                        None,
+-                                    )
+-                                    kind = (
+-                                        "elemental_tuning:"
+-                                        f"{definition_id!r}:{type(definition_id).__name__}"
+-                                    )
+-                                elif action.HasField("switch_active"):
+-                                    target_id = getattr(action.switch_active, "active_character_id", None)
+-                                    kind = f"switch_active:{target_id!r}:{type(target_id).__name__}"
+-                                elif action.HasField("declare_end"):
+-                                    kind = "declare_end"
+-                                rendered.append(f"{index}:{kind}")
+-                            return f"actions={rendered}"
+-                        return repr(request)
+-
+-                    self.last_request_type = request_type.name
+-                    self.last_request_summary = _request_summary(request_type, request)
+-                    self.last_response_payload = None
+                     state_ref = game.state()
+                     try:
+                         try:
+@@ -426,28 +369,16 @@ class GitcgDecisionEnv:
+                                 f"error={type(exc).__name__}: {exc}",
+                                 flush=True,
+                             )
+                             raise
+                     finally:
+                         _safe_release(state_ref)
++                    if request_type == DecisionType.SELECT_CARD and any(
++                        int(value) == 116092 for value in (getattr(request, "candidate_definition_ids", ()) or ())
++                    ):
++                        _append_state_probe(
++                            {
++                                "kind": "select_card_request_state",
++                                "matchup": env._matchup.key,
++                                "seed": env._seed,
++                                "player": self.who,
++                                "step_index": step_index_ref["value"],
++                                "candidate_definition_ids": [repr(value) for value in (getattr(request, "candidate_definition_ids", ()) or ())],
++                                "focus": _state_focus(raw_state_json),
++                            }
++                        )
+                     full_state_json = raw_state_json if env._config.record_full_state_json else None
+                     visible_snapshot = None
+                     if self.last_notification is not None:
+                         visible_snapshot = snapshot_notification(self.last_notification)
+-                    if request_type == DecisionType.SELECT_CARD:
+-                        raw_candidates = list(getattr(request, "candidate_definition_ids", ()))
+-                        if any(
+-                            (
+-                                isinstance(value, float) and not value.is_integer()
+-                            ) or (
+-                                not isinstance(value, (int, bool, float))
+-                            )
+-                            for value in raw_candidates
+-                        ):
+-                            print(
+-                                "[select-card-trace] "
+-                                f"stage=env.request matchup={env._matchup.key} seed={env._seed} player={self.who} "
+-                                f"step={step_index_ref['value']} candidates={[repr(v) + ':' + type(v).__name__ for v in raw_candidates]}",
+-                                flush=True,
+-                            )
+                     built_context = build_decision_context(
+                         acting_player=self.who,
+                         request_type=request_type,
+@@ -462,30 +393,9 @@ class GitcgDecisionEnv:
+                         },
+                         enable_result_based_action_relabel=env._enable_result_based_action_relabel,
+                     )
+                     context = built_context.context
+-                    self.last_request_type = request_type.name
+-                    self.last_request_summary = self._request_summary(request_type, request)
+                     step_index_ref["value"] += 1
+                     if not env._config.record_player_view:
+                         context = replace(context, player_view=None)
+                         built_context = BuiltDecisionContext(
+                             context=context,
+@@ -494,37 +404,13 @@ class GitcgDecisionEnv:
+                             label_by_low_level_code=built_context.label_by_low_level_code,
+                             low_to_high_code=built_context.low_to_high_code,
+                         )
+                     env._current_built_context = built_context
+-                    legal_labels = [
+-                        built_context.label_by_low_level_code.get(int(code), f"action:{int(code)}")
+-                        for code in context.legal_low_level_codes
+-                    ]
+-                    self._push_trace(
+-                        {
+-                            "kind": "request",
+-                            "matchup": env._matchup.key,
+-                            "seed": env._seed,
+-                            "player": self.who,
+-                            "step_index": context.step_index,
+-                            "request_type": request_type.name,
+-                            "request_summary": self.last_request_summary,
+-                            "state": _state_brief(full_state),
+-                            "legal_low_level_codes": [int(code) for code in context.legal_low_level_codes],
+-                            "legal_labels": legal_labels,
+-                        }
+-                    )
+                     env._event_queue.put(_DecisionEvent(context))
+                     if env._shutdown_requested.is_set():
+-                        payload = encode_choice(built_context, _fallback_action_code(context))
+-                        self.last_response_payload = dict(payload)
+-                        self._push_trace(
+-                            {
+-                                "kind": "response",
+-                                "matchup": env._matchup.key,
+-                                "seed": env._seed,
+-                                "player": self.who,
+-                                "step_index": context.step_index,
+-                                "request_type": request_type.name,
+-                                "payload": payload,
+-                                "fallback": True,
+-                            }
+-                        )
+-                        return payload
++                        return encode_choice(built_context, _fallback_action_code(context))
+                     action_code = env._response_queue.get()
+                     if isinstance(action_code, _Shutdown):
+-                        payload = encode_choice(built_context, _fallback_action_code(context))
+-                        self.last_response_payload = dict(payload)
+-                        self._push_trace(
+-                            {
+-                                "kind": "response",
+-                                "matchup": env._matchup.key,
+-                                "seed": env._seed,
+-                                "player": self.who,
+-                                "step_index": context.step_index,
+-                                "request_type": request_type.name,
+-                                "payload": payload,
+-                                "fallback": True,
+-                            }
+-                        )
+-                        return payload
++                        return encode_choice(built_context, _fallback_action_code(context))
+                     payload = encode_choice(built_context, int(action_code))
+-                    self.last_response_payload = dict(payload)
+-                    self._push_trace(
+-                        {
+-                            "kind": "response",
+-                            "matchup": env._matchup.key,
+-                            "seed": env._seed,
+-                            "player": self.who,
+-                            "step_index": context.step_index,
+-                            "request_type": request_type.name,
+-                            "action_code": int(action_code),
+-                            "payload": payload,
+-                        }
+-                    )
++                    if request_type == DecisionType.SELECT_CARD and int(payload.get("selected_definition_id", -1)) == 116092:
++                        _append_state_probe(
++                            {
++                                "kind": "select_card_response",
++                                "matchup": env._matchup.key,
++                                "seed": env._seed,
++                                "player": self.who,
++                                "step_index": context.step_index,
++                                "action_code": int(action_code),
++                                "payload": dict(payload),
++                            }
++                        )
+                     return payload
+
+             player0 = BridgePlayer(0)
+@@ -546,6 +432,18 @@ class GitcgDecisionEnv:
+                 final_state = snapshot_state(final_state_ref, state_json=raw_state_json)
+                 final_state_json = raw_state_json if self._config.record_full_state_json else None
+                 status_name = game.status().name
+                 raw_winner = game.winner()
+                 error_message = game.error() if status_name == "ABORTED" else None
++                if player0.last_error is not None or player1.last_error is not None:
++                    _append_state_probe(
++                        {
++                            "kind": "io_error_terminal_state",
++                            "matchup": self._matchup.key,
++                            "seed": self._seed,
++                            "status": status_name,
++                            "raw_winner": raw_winner,
++                            "player0_io_error": player0.last_error,
++                            "player1_io_error": player1.last_error,
++                            "focus": _state_focus(raw_state_json),
++                        }
++                    )
+                 sanitized_winner, invalid_terminal_reason = _validate_terminal_outcome(
+                     final_state,
+                     raw_winner,
+@@ -581,14 +479,16 @@ class GitcgDecisionEnv:
+                         f"error={error_message!r} "
+                         f"player0_io_error={player0.last_error!r} "
+                         f"player1_io_error={player1.last_error!r}",
+                         flush=True,
+                     )
+-                    _append_trace_event(
++                    _append_state_probe(
+                         {
+-                            "kind": "terminal_guard",
++                            "kind": "terminal_guard_state",
+                             "matchup": self._matchup.key,
+                             "seed": self._seed,
+                             "reason": invalid_terminal_reason,
+                             "status": status_name,
+                             "raw_winner": raw_winner,
+                             "sanitized_winner": sanitized_winner,
+                             "error": error_message,
++                            "focus": _state_focus(raw_state_json),
+                         }
+                     )
+             finally:
+                 _safe_release(final_state_ref)

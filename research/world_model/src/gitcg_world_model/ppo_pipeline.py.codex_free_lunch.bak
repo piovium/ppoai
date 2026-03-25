@@ -55,14 +55,8 @@ from .managed_loop_utils import (
     write_episode_analysis,
     write_runtime_manifest,
 )
-from .replay import (
-    append_episode_records,
-    deserialize_episode_record,
-    iter_episode_record_payloads,
-    iter_episode_records,
-    load_episode_records,
-)
-from .schema import EnvConfig, EpisodeRecord, Matchup, PlayerSnapshot, StateSnapshot
+from .replay import append_episode_records, iter_episode_records, load_episode_records
+from .schema import EnvConfig, EpisodeRecord, Matchup
 
 
 BootstrapProgressCallback = Callable[[int, int, EpisodeRecord], None]
@@ -111,24 +105,6 @@ _PHASE_RANKS: dict[str, int] = {
     "active_br_slot": 2,
     "round_finalize": 3,
 }
-
-_BENCHMARK_CACHE_FORMAT = "benchmark_episode_summary_v1"
-_BENCHMARK_WORKERS_ENV = "P2SRO_BENCHMARK_WORKERS"
-_BENCHMARK_CACHE_FLUSH_ENV = "P2SRO_BENCHMARK_CACHE_FLUSH_THRESHOLD"
-_DEFAULT_BENCHMARK_WORKER_CAP = 2
-_DEFAULT_BENCHMARK_CACHE_FLUSH = 8
-_EMPTY_CACHE_PLAYER = PlayerSnapshot(
-    active_character_id=None,
-    characters=(),
-    combat_statuses=(),
-    summons=(),
-    supports=(),
-    hand_cards=(),
-    pile_cards=(),
-    dice=(),
-    declared_end=False,
-    legend_used=False,
-)
 
 
 def _phase_rank(phase: str | None) -> int:
@@ -521,114 +497,8 @@ def _episode_retry_reason(*, episode: EpisodeRecord, config: EnvConfig) -> str |
 
 
 def _benchmark_eval_workers(requested_workers: int) -> int:
-    requested = max(1, int(requested_workers))
-    raw_override = os.environ.get(_BENCHMARK_WORKERS_ENV)
-    if raw_override is not None:
-        try:
-            override = max(1, int(raw_override.strip()))
-        except ValueError:
-            override = _DEFAULT_BENCHMARK_WORKER_CAP
-        return min(requested, override)
-    # Selection / payoff evaluation previously forced single-worker execution to
-    # avoid JS heap OOMs. Keep the cap conservative, but allow a small amount of
-    # parallelism now that benchmark caches are compact.
-    return min(requested, _DEFAULT_BENCHMARK_WORKER_CAP)
-
-
-def _benchmark_eval_flush_threshold(total_jobs: int) -> int:
-    total = max(1, int(total_jobs))
-    raw_override = os.environ.get(_BENCHMARK_CACHE_FLUSH_ENV)
-    if raw_override is not None:
-        try:
-            override = max(1, int(raw_override.strip()))
-        except ValueError:
-            override = _DEFAULT_BENCHMARK_CACHE_FLUSH
-        return min(total, override)
-    return min(total, _DEFAULT_BENCHMARK_CACHE_FLUSH)
-
-
-def _cached_benchmark_final_state(winner: int | None) -> StateSnapshot:
-    return StateSnapshot(
-        phase="benchmark_cache",
-        round_number=0,
-        current_turn=-1,
-        winner=winner,
-        players=(_EMPTY_CACHE_PLAYER, _EMPTY_CACHE_PLAYER),
-    )
-
-
-def _serialize_benchmark_cache_episode(episode: EpisodeRecord) -> dict[str, Any]:
-    return {
-        "_wm_cache_format": _BENCHMARK_CACHE_FORMAT,
-        "matchup": episode.matchup,
-        "seed": episode.seed,
-        "winner": episode.winner,
-        "step_count": len(episode.steps),
-        "metadata": dict(episode.metadata),
-    }
-
-
-def _deserialize_benchmark_cache_episode(payload: dict[str, Any]) -> EpisodeRecord:
-    winner = payload.get("winner")
-    return EpisodeRecord(
-        matchup=str(payload["matchup"]),
-        seed=payload.get("seed"),
-        winner=winner,
-        steps=(),
-        final_state=_cached_benchmark_final_state(winner if winner in {0, 1} else None),
-        final_state_json=None,
-        metadata=dict(payload.get("metadata", {})),
-    )
-
-
-def _append_benchmark_cache_episodes(path: Path, episodes: Sequence[EpisodeRecord]) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("a", encoding="utf-8") as handle:
-        for episode in episodes:
-            handle.write(json.dumps(_serialize_benchmark_cache_episode(episode), sort_keys=True))
-            handle.write("\n")
-
-
-def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
-    source = Path(path)
-    cached: list[EpisodeRecord] = []
-    if not source.exists():
-        return cached
-    with source.open("r", encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                if not raw_line.endswith("\n"):
-                    print(
-                        "[benchmark-cache-warning] "
-                        f"path={source} line={line_number} reason=truncated_tail_record skipped=True",
-                        flush=True,
-                    )
-                    break
-                raise ValueError(
-                    f"Malformed benchmark cache record at {source}:{line_number}"
-                ) from exc
-            try:
-                if payload.get("_wm_cache_format") == _BENCHMARK_CACHE_FORMAT:
-                    cached.append(_deserialize_benchmark_cache_episode(payload))
-                    continue
-                if "final_state" in payload:
-                    cached.append(deserialize_episode_record(payload))
-                    continue
-            except Exception as exc:
-                raise ValueError(
-                    f"Failed to deserialize benchmark cache record at {source}:{line_number}"
-                ) from exc
-            raise ValueError(
-                f"Unsupported benchmark cache record at {source}:{line_number} "
-                f"keys={sorted(payload.keys())}"
-            )
-    return cached
+    # Selection / payoff evaluation has been the main source of JS heap OOMs.
+    return 1 if requested_workers > 0 else 1
 
 
 def _run_episode_job(
@@ -729,8 +599,6 @@ def _execute_episode_jobs(
     output_path: str | Path | None = None,
     progress_callback: Callable[[int, int, _EpisodeJobResult], None] | None = None,
     flush_threshold: int = 8,
-    load_persisted_episodes: Callable[[Path], list[EpisodeRecord]] | None = None,
-    persist_episodes: Callable[[Path, Sequence[EpisodeRecord]], None] | None = None,
 ) -> tuple[EpisodeRecord, ...]:
     destination = Path(output_path) if output_path is not None else None
     total = len(jobs)
@@ -738,15 +606,13 @@ def _execute_episode_jobs(
     effective_workers = max(1, workers)
     pending_episodes: list[EpisodeRecord] = []
     flush_threshold = max(1, int(flush_threshold))
-    episode_loader = load_persisted_episodes or load_episode_records
-    episode_persister = persist_episodes or append_episode_records
 
     def episode_key(*, matchup: str, seed: int | None) -> tuple[str, int | None]:
         return (matchup, seed)
 
     existing_by_key: dict[tuple[str, int | None], EpisodeRecord] = {}
     if destination is not None and destination.exists():
-        for episode in episode_loader(destination):
+        for episode in load_episode_records(destination):
             existing_by_key.setdefault(
                 episode_key(matchup=episode.matchup, seed=episode.seed),
                 episode,
@@ -766,7 +632,7 @@ def _execute_episode_jobs(
         if destination is None or not pending_episodes:
             pending_episodes = []
             return
-        episode_persister(destination, pending_episodes)
+        append_episode_records(destination, pending_episodes)
         pending_episodes = []
         gc.collect()
 
@@ -1729,7 +1595,6 @@ def _evaluate_checkpoint_against_population(
             if output_dir is not None
             else None
         )
-        flush_threshold = _benchmark_eval_flush_threshold(len(jobs))
         episodes = _execute_episode_jobs(
             config=env_config,
             jobs=jobs,
@@ -1741,9 +1606,7 @@ def _evaluate_checkpoint_against_population(
                     progress_callback(done, total, result.episode, opponent_policy_id))
                 if progress_callback is not None else None
             ),
-            flush_threshold=flush_threshold,
-            load_persisted_episodes=_load_benchmark_cache_episodes,
-            persist_episodes=_append_benchmark_cache_episodes,
+            flush_threshold=1,
         )
         wins = sum(1 for episode in episodes if episode.winner == 0)
         losses = sum(1 for episode in episodes if episode.winner == 1)
@@ -1966,7 +1829,6 @@ def _update_p2sro_payoff_matrix(
             if cache_dir is not None
             else None
         )
-        flush_threshold = _benchmark_eval_flush_threshold(len(jobs))
         episodes = _execute_episode_jobs(
             config=env_config,
             jobs=jobs,
@@ -1985,9 +1847,7 @@ def _update_p2sro_payoff_matrix(
                     ))
                 if enable_status_print else None
             ),
-            flush_threshold=flush_threshold,
-            load_persisted_episodes=_load_benchmark_cache_episodes,
-            persist_episodes=_append_benchmark_cache_episodes,
+            flush_threshold=1,
         )
         wins = sum(1 for episode in episodes if episode.winner == 0)
         losses = sum(1 for episode in episodes if episode.winner == 1)

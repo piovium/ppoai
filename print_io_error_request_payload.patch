@@ -1,0 +1,113 @@
+diff --git a/research/world_model/src/gitcg_world_model/env.py b/research/world_model/src/gitcg_world_model/env.py
+index fc65220..patched 100644
+--- a/research/world_model/src/gitcg_world_model/env.py
++++ b/research/world_model/src/gitcg_world_model/env.py
+@@ -214,14 +214,36 @@ class GitcgDecisionEnv:
+
+             class BridgePlayer(gitcg.Player):
+                 def __init__(self, who: int):
+                     self.who = who
+                     self.last_notification = None
+                     self.last_error: str | None = None
++                    self.last_request_type: str | None = None
++                    self.last_request_summary: str | None = None
++                    self.last_response_payload: dict[str, Any] | None = None
+
+                 def on_notify(self, notification):
+                     self.last_notification = notification
+
+                 def on_io_error(self, error_msg: str):
+                     self.last_error = error_msg
++                    print(
++                        "[io-error] "
++                        f"matchup={env._matchup.key} "
++                        f"seed={env._seed} "
++                        f"player={self.who} "
++                        f"request_type={self.last_request_type!r} "
++                        f"request={self.last_request_summary!r} "
++                        f"response_payload={self.last_response_payload!r} "
++                        f"error={error_msg!r}",
++                        flush=True,
++                    )
+
+                 def on_choose_active(self, request):
+                     payload = self._await_payload(DecisionType.CHOOSE_ACTIVE, request)
+                     return gitcg.ChooseActiveResponse(**payload)
+@@ -237,9 +259,54 @@ class GitcgDecisionEnv:
+                 def on_action(self, request):
+                     payload = self._await_payload(DecisionType.ACTION, request)
+                     return gitcg.ActionResponse(**payload)
+
+                 def _await_payload(self, request_type: DecisionType, request: Any) -> dict[str, Any]:
++                    def _request_summary(request_type: DecisionType, request: Any) -> str:
++                        if request_type == DecisionType.SELECT_CARD:
++                            values = list(getattr(request, "candidate_definition_ids", ()))
++                            typed = [f"{value!r}:{type(value).__name__}" for value in values]
++                            return f"candidate_definition_ids={typed}"
++                        if request_type == DecisionType.CHOOSE_ACTIVE:
++                            values = list(getattr(request, "candidate_ids", ()))
++                            typed = [f"{value!r}:{type(value).__name__}" for value in values]
++                            return f"candidate_ids={typed}"
++                        if request_type == DecisionType.SWITCH_HANDS:
++                            values = list(getattr(request, "candidate_hand_ids", ()))
++                            typed = [f"{value!r}:{type(value).__name__}" for value in values]
++                            return f"candidate_hand_ids={typed}"
++                        if request_type == DecisionType.REROLL_DICE:
++                            return f"dice_count={len(list(getattr(request, 'dice', ())))}"
++                        if request_type == DecisionType.ACTION:
++                            actions = list(getattr(request, "action", ()))
++                            rendered: list[str] = []
++                            for index, action in enumerate(actions):
++                                kind = "unknown"
++                                if action.HasField("play_card"):
++                                    definition_id = getattr(action.play_card, "card_definition_id", None)
++                                    kind = f"play_card:{definition_id!r}:{type(definition_id).__name__}"
++                                elif action.HasField("use_skill"):
++                                    definition_id = getattr(action.use_skill, "skill_definition_id", None)
++                                    kind = f"use_skill:{definition_id!r}:{type(definition_id).__name__}"
++                                elif action.HasField("elemental_tuning"):
++                                    definition_id = getattr(
++                                        action.elemental_tuning,
++                                        "discarded_card_definition_id",
++                                        None,
++                                    )
++                                    kind = (
++                                        "elemental_tuning:"
++                                        f"{definition_id!r}:{type(definition_id).__name__}"
++                                    )
++                                elif action.HasField("switch_active"):
++                                    target_id = getattr(action.switch_active, "active_character_id", None)
++                                    kind = f"switch_active:{target_id!r}:{type(target_id).__name__}"
++                                elif action.HasField("declare_end"):
++                                    kind = "declare_end"
++                                rendered.append(f"{index}:{kind}")
++                            return f"actions={rendered}"
++                        return repr(request)
++
++                    self.last_request_type = request_type.name
++                    self.last_request_summary = _request_summary(request_type, request)
++                    self.last_response_payload = None
+                     state_ref = game.state()
+                     try:
+                         raw_state_json = state_ref.json()
+                         full_state = snapshot_state(state_ref, state_json=raw_state_json)
+                     finally:
+@@ -279,8 +346,10 @@ class GitcgDecisionEnv:
+                     env._current_built_context = built_context
+                     env._event_queue.put(_DecisionEvent(context))
+                     if env._shutdown_requested.is_set():
+-                        return encode_choice(built_context, _fallback_action_code(context))
++                        payload = encode_choice(built_context, _fallback_action_code(context))
++                        self.last_response_payload = dict(payload)
++                        return payload
+                     action_code = env._response_queue.get()
+                     if isinstance(action_code, _Shutdown):
+                         env._shutdown_requested.set()
+-                        return encode_choice(built_context, _fallback_action_code(context))
+-                    return encode_choice(built_context, int(action_code))
++                        payload = encode_choice(built_context, _fallback_action_code(context))
++                        self.last_response_payload = dict(payload)
++                        return payload
++                    payload = encode_choice(built_context, int(action_code))
++                    self.last_response_payload = dict(payload)
++                    return payload

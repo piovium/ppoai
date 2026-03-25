@@ -1,0 +1,31 @@
+--- a/research/world_model/src/gitcg_world_model/lookahead_search.py
++++ b/research/world_model/src/gitcg_world_model/lookahead_search.py
+@@ -508,7 +508,7 @@
+         max_rounds=env_config.max_rounds,
+         seed=env_config.seed,
+         seed_policy=env_config.seed_policy,
+-        record_full_state_json=True,
++        record_full_state_json=False,
+         record_player_view=True,
+         draw_penalty=env_config.draw_penalty,
+     )
+--- a/research/world_model/src/gitcg_world_model/ppo_training.py
++++ b/research/world_model/src/gitcg_world_model/ppo_training.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import gc
+ import json
+ import math
+ from contextlib import nullcontext
+@@ -386,6 +387,10 @@
+             env_config=env_config,
+             config=resolved_search_config,
+         )
++        del teacher_model
++        gc.collect()
++        if torch.cuda.is_available() and torch.device(device).type == "cuda":
++            torch.cuda.empty_cache()
+     fresh_chunks = build_ppo_chunks(
+         training_episodes,
+         encoder,

@@ -1,0 +1,40 @@
+diff --git a/research/world_model/src/gitcg_world_model/env.py b/research/world_model/src/gitcg_world_model/env.py
+index fc65220..patched 100644
+--- a/research/world_model/src/gitcg_world_model/env.py
++++ b/research/world_model/src/gitcg_world_model/env.py
+@@ -286,8 +286,10 @@ class GitcgDecisionEnv:
+                         return encode_choice(built_context, _fallback_action_code(context))
+                     return encode_choice(built_context, int(action_code))
+
+-            game.set_player(0, BridgePlayer(0))
+-            game.set_player(1, BridgePlayer(1))
++            player0 = BridgePlayer(0)
++            player1 = BridgePlayer(1)
++            game.set_player(0, player0)
++            game.set_player(1, player1)
+             game.start()
+             while game.is_running():
+                 game.step()
+@@ -314,6 +316,8 @@ class GitcgDecisionEnv:
+                         "winner": sanitized_winner,
+                         "raw_winner": raw_winner,
+                         "error": error_message,
++                        "player0_io_error": player0.last_error,
++                        "player1_io_error": player1.last_error,
+                         "invalid_terminal": bool(invalid_terminal_reason),
+                         "invalid_terminal_reason": invalid_terminal_reason,
+                     },
+@@ -324,8 +328,11 @@ class GitcgDecisionEnv:
+                         f"matchup={self._matchup.key} "
+                         f"seed={self._seed} "
+                         f"reason={invalid_terminal_reason} "
++                        f"status={status_name} "
+                         f"raw_winner={raw_winner} "
+-                        f"sanitized_winner={sanitized_winner}",
++                        f"sanitized_winner={sanitized_winner} "
++                        f"error={error_message!r} "
++                        f"player0_io_error={player0.last_error!r} "
++                        f"player1_io_error={player1.last_error!r}",
+                         flush=True,
+                     )
+             finally:

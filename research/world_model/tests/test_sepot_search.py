@@ -12,6 +12,7 @@ from gitcg_world_model.ppo_model import PpoModelConfig, PpoTransformerPolicy
 from gitcg_world_model.public_state import PublicStateTracker
 from gitcg_world_model.schema import DecisionContext
 from gitcg_world_model.sepot_search import (
+    SePotPhaseBudget,
     SePotSearchController,
     SePotSearchConfig,
     build_public_belief_state,
@@ -301,7 +302,7 @@ class SePotSearchTests(unittest.TestCase):
             call_count["value"] += 1
             if call_count["value"] == 1:
                 return 0.42
-            raise sepot_search_module._SearchTimeout()
+            return None
 
         controller._advance_until_action = fake_advance_until_action  # type: ignore[method-assign]
         controller._evaluate_internal_self_candidate = fake_internal_candidate  # type: ignore[method-assign]
@@ -309,6 +310,8 @@ class SePotSearchTests(unittest.TestCase):
         dummy_env = type("DummyEnv", (), {"_config": None, "_matchup": None})()
         sampled_self = belief.self_range.hypotheses[0]
         sampled_opponent = belief.opponent_range.hypotheses[0]
+        matchup = sepot_search_module._matchup_from_key(episode.matchup)
+        env_config = sepot_search_module._env_config_from_matchup(matchup)
         fake_log_probs = tuple(
             float(len(context.legal_low_level_codes) - index)
             for index in range(len(context.legal_low_level_codes))
@@ -336,10 +339,103 @@ class SePotSearchTests(unittest.TestCase):
                 current_tracker=tracker,
                 policy_cache={},
                 leaf_value_cache={},
+                env_config=env_config,
+                matchup=matchup,
             )
 
         self.assertAlmostEqual(value, 0.42, places=6)
         self.assertEqual(call_count["value"], 2)
+
+    def test_evaluate_root_candidate_handles_terminal_branch_step_without_context(self):
+        episode = synthetic_episode_record()
+        step = next(item for item in episode.steps if item.request_type.value == "action")
+        context = DecisionContext(
+            acting_player=step.acting_player,
+            request_type=step.request_type,
+            step_index=0,
+            full_state=step.pre_state,
+            legal_low_level_codes=step.legal_low_level_codes,
+            legal_low_level_specs=step.legal_low_level_specs,
+            legal_low_level_mask=step.legal_low_level_mask,
+            legal_high_level_codes=step.legal_high_level_codes,
+            high_to_low_map=step.high_to_low_map,
+            player_view=step.player_view,
+            metadata={
+                "matchup": episode.matchup,
+                "opponent_deck_name": "sample_b",
+            },
+            full_state_json=step.full_state_json_before or "{}",
+        )
+        encoder = TokenObservationEncoder()
+        controller = SePotSearchController(card_vocabulary=encoder.config.card_vocabulary)
+        tracker = PublicStateTracker(player_id=int(step.acting_player))
+        budget = SePotPhaseBudget(depth=2, root_top_k=1, belief_samples=1, timeout_ms=1000)
+        belief = build_public_belief_state(
+            context=context,
+            tracker=tracker,
+            card_vocabulary=encoder.config.card_vocabulary,
+            opponent_deck_name="sample_b",
+            belief_histogram=(0.0,) * encoder.belief_histogram_dim,
+            belief_remaining_deck_histogram=(0.0,) * encoder.belief_remaining_deck_histogram_dim,
+            belief_samples=budget.belief_samples,
+            root_player=int(step.acting_player),
+        )
+        matchup = sepot_search_module._matchup_from_key(episode.matchup)
+        env_config = sepot_search_module._env_config_from_matchup(matchup)
+        captured: dict[str, object] = {}
+
+        def fake_rollout_value(**kwargs):
+            captured["current_context"] = kwargs["current_context"]
+            captured["current_sampled_state_json"] = kwargs["current_sampled_state_json"]
+            return 0.5
+
+        controller._rollout_value = fake_rollout_value  # type: ignore[method-assign]
+
+        class FakeEnv:
+            def step(self, _choice):
+                return None, step, True
+
+            def close(self):
+                return None
+
+        class FakeUpdater:
+            def update_after_step(self, **_kwargs):
+                return type(
+                    "UpdateResult",
+                    (),
+                    {
+                        "updated_public_belief": belief,
+                        "sampled_self_hypothesis": belief.self_range.hypotheses[0],
+                        "sampled_opponent_hypothesis": belief.opponent_range.hypotheses[0],
+                    },
+                )()
+
+        with patch.object(sepot_search_module, "_try_reset_branch_env", return_value=(FakeEnv(), context)):
+            value = controller._evaluate_root_candidate(
+                root_context=context,
+                root_history=[],
+                root_tracker=tracker,
+                root_public_belief=belief,
+                root_action_code=int(context.legal_low_level_codes[0]),
+                sampled_opponent_hypothesis=belief.opponent_range.hypotheses[0],
+                model=None,
+                encoder=encoder,
+                device=torch.device("cpu"),
+                budget=budget,
+                deadline=1.0e9,
+                reconstructor=None,
+                updater=FakeUpdater(),
+                opponent_deck_name="sample_b",
+                search_state_value_fn=lambda **_: torch.tensor([0.0], dtype=torch.float32),
+                policy_cache={},
+                leaf_value_cache={},
+                env_config=env_config,
+                matchup=matchup,
+            )
+
+        self.assertAlmostEqual(value, 0.5, places=6)
+        self.assertIsNone(captured["current_context"])
+        self.assertIsNone(captured["current_sampled_state_json"])
 
 
 if __name__ == "__main__":

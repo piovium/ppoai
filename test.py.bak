@@ -1,0 +1,124 @@
+
+import gitcg
+from research.world_model.src.gitcg_world_model.decks import deck_by_name
+
+class ProbePlayer(gitcg.Player):
+    def __init__(self, who):
+        self.who = who
+        self.last_notification = None
+        self.turn = 0
+    def on_notify(self, notification):
+        self.last_notification = notification
+    def on_io_error(self, error_msg: str):
+        print(f'[io_error] player={self.who} error={error_msg}')
+    def on_switch_hands(self, request):
+        return gitcg.SwitchHandsResponse(removed_hand_ids=[])
+    def on_choose_active(self, request):
+        return gitcg.ChooseActiveResponse(active_character_id=(request.candidate_ids[0] if self.who == 0 else request.candidate_ids[-1]))
+    def on_reroll_dice(self, request):
+        # round1 trace-like, later keep all
+        if self.last_notification and self.last_notification.state.round_number == 1:
+            return gitcg.RerollDiceResponse(dice_to_reroll=([2,2,5] if self.who == 0 else [2,2,3,3,4,5,8,8]))
+        return gitcg.RerollDiceResponse(dice_to_reroll=[])
+    def on_select_card(self, request):
+        return gitcg.SelectCardResponse(selected_definition_id=116092) # 这里的问题，这里明显是整数
+    def on_action(self, request):
+        self.turn += 1
+        actions = list(request.action)
+        info = []
+        for i, a in enumerate(actions):
+            tag = 'unknown'
+            if a.HasField('use_skill'):
+                tag = f'use_skill:{int(a.use_skill.skill_definition_id)}'
+            elif a.HasField('play_card'):
+                tag = f'play_card:{int(a.play_card.card_definition_id)}'
+            elif a.HasField('elemental_tuning'):
+                tag = f'elemental_tuning:{int(a.elemental_tuning.target_dice)}'
+            elif a.HasField('switch_active'):
+                tag = 'switch_active'
+            elif a.HasField('declare_end'):
+                tag = 'declare_end'
+            info.append((i, tag, int(a.validity), list(a.auto_selected_dice)))
+        print(f'\n[p{self.who} turn={self.turn} round={self.last_notification.state.round_number if self.last_notification else None}]')
+        for row in info:
+            print(row)
+
+        def pick_tag(prefix):
+            for i, tag, validity, auto in info:
+                if tag == prefix and validity == 0:
+                    return i, auto
+            return None, None
+        def pick_decl():
+            for i, tag, validity, auto in info:
+                if tag == 'declare_end' and validity == 0:
+                    return i, auto
+            return None, None
+
+        if self.who == 0:
+            # follow failing semantic chain as far as possible
+            desired = {
+                1: 'use_skill:16092',
+                2: 'play_card:323004',
+                3: 'play_card:330005',
+                4: 'play_card:331601',
+                5: 'play_card:332002',
+                6: 'play_card:312004',
+                7: 'switch_active',
+                8: 'use_skill:16081',
+                9: 'switch_active',
+            }.get(self.turn)
+            if desired:
+                idx, auto = pick_tag(desired)
+                if idx is not None:
+                    print('pick desired', desired, idx, auto)
+                    return gitcg.ActionResponse(chosen_action_index=idx, used_dice=auto)
+        else:
+            desired = {
+                1: 'use_skill:21031',
+                2: 'use_skill:16081',
+                3: 'play_card:330008',
+                4: 'play_card:332006',
+            }.get(self.turn)
+            if desired:
+                idx, auto = pick_tag(desired)
+                if idx is not None:
+                    print('pick desired', desired, idx, auto)
+                    return gitcg.ActionResponse(chosen_action_index=idx, used_dice=auto)
+
+        idx, auto = pick_decl()
+        if idx is not None:
+            print('pick declare_end', idx)
+            return gitcg.ActionResponse(chosen_action_index=idx, used_dice=[])
+        print('fallback 0')
+        return gitcg.ActionResponse(chosen_action_index=0, used_dice=list(info[0][3]))
+
+p0 = ProbePlayer(0)
+p1 = ProbePlayer(1)
+gitcg.thread_initialize()
+try:
+    d0 = deck_by_name('sample_b')
+    d1 = deck_by_name('sample_a')
+    cp = gitcg.CreateParam(deck0=gitcg.Deck(characters=list(d0.characters), cards=list(d0.cards)), deck1=gitcg.Deck(characters=list(d1.characters), cards=list(d1.cards)))
+    cp.set_attr(gitcg.low_level.ATTR_STATE_CONFIG_RANDOM_SEED, 102011)
+    state = gitcg.State(create_param=cp)
+    game = gitcg.Game(state=state)
+    game.set_player(0, p0)
+    game.set_player(1, p1)
+    game.start()
+    n=0
+    while game.is_running() and n<80:
+        n+=1
+        game.step()
+    print('status', game.status().name)
+    if game.status().name=='ABORTED':
+        print('game_error', game.error())
+    else:
+        print('winner', game.winner())
+finally:
+    try: game._finalize()
+    except Exception: pass
+    try: state._finalize()
+    except Exception: pass
+    try: cp._finalize()
+    except Exception: pass
+    gitcg.thread_cleanup()
