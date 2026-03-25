@@ -4,13 +4,14 @@ from dataclasses import dataclass
 from statistics import mean
 from typing import Sequence
 
+from .managed_loop_utils import episode_step_count
+
 from .action_quality import (
     declare_end_waste_ratio,
     declare_end_with_productive_options,
     is_declare_end_option,
     selected_option,
 )
-from .episode_utils import episode_step_count
 from .schema import EpisodeRecord
 
 

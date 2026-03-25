@@ -45,7 +45,6 @@ class _InferenceRequest:
     recurrent_state: tuple[float, ...] | None
     sample: bool
     temperature: float
-    return_details: bool
     response_queue: queue.Queue[InferenceResult | BaseException]
 
 
@@ -90,7 +89,6 @@ class GpuInferenceServer:
         recurrent_state: tuple[float, ...] | None,
         sample: bool,
         temperature: float,
-        return_details: bool = True,
     ) -> InferenceResult:
         response_queue: queue.Queue[InferenceResult | BaseException] = queue.Queue(maxsize=1)
         self._queue.put(
@@ -107,7 +105,6 @@ class GpuInferenceServer:
                 recurrent_state=recurrent_state,
                 sample=sample,
                 temperature=temperature,
-                return_details=return_details,
                 response_queue=response_queue,
             )
         )
@@ -245,28 +242,16 @@ class GpuInferenceServer:
                             if output.recurrent_state is not None
                             else None
                         ),
-                        log_probs=(
-                            tuple(float(value) for value in log_probs[index].detach().cpu().tolist())
-                            if request.return_details
-                            else ()
+                        log_probs=tuple(float(value) for value in log_probs[index].detach().cpu().tolist()),
+                        belief_histogram=tuple(
+                            float(value) for value in output.belief_histogram[index].detach().cpu().tolist()
                         ),
-                        belief_histogram=(
-                            tuple(float(value) for value in output.belief_histogram[index].detach().cpu().tolist())
-                            if request.return_details
-                            else ()
+                        belief_remaining_deck_histogram=tuple(
+                            float(value)
+                            for value in output.belief_remaining_deck_histogram[index].detach().cpu().tolist()
                         ),
-                        belief_remaining_deck_histogram=(
-                            tuple(
-                                float(value)
-                                for value in output.belief_remaining_deck_histogram[index].detach().cpu().tolist()
-                            )
-                            if request.return_details
-                            else ()
-                        ),
-                        high_policy_logits=(
-                            tuple(float(value) for value in output.high_policy_logits[index].detach().cpu().tolist())
-                            if request.return_details
-                            else ()
+                        high_policy_logits=tuple(
+                            float(value) for value in output.high_policy_logits[index].detach().cpu().tolist()
                         ),
                     )
                 )

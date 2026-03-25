@@ -50,7 +50,6 @@ from .managed_loop_utils import (
     append_history,
     auto_device,
     cleanup_completed_round_training_temps,
-    episode_step_count,
     prune_old_round_directories,
     print_episode_progress,
     write_episode_analysis,
@@ -116,7 +115,7 @@ _PHASE_RANKS: dict[str, int] = {
 _BENCHMARK_CACHE_FORMAT = "benchmark_episode_summary_v1"
 _BENCHMARK_WORKERS_ENV = "P2SRO_BENCHMARK_WORKERS"
 _BENCHMARK_CACHE_FLUSH_ENV = "P2SRO_BENCHMARK_CACHE_FLUSH_THRESHOLD"
-_DEFAULT_BENCHMARK_WORKER_CAP = 3
+_DEFAULT_BENCHMARK_WORKER_CAP = 2
 _DEFAULT_BENCHMARK_CACHE_FLUSH = 8
 _EMPTY_CACHE_PLAYER = PlayerSnapshot(
     active_character_id=None,
@@ -564,21 +563,13 @@ def _serialize_benchmark_cache_episode(episode: EpisodeRecord) -> dict[str, Any]
         "matchup": episode.matchup,
         "seed": episode.seed,
         "winner": episode.winner,
-        "step_count": episode_step_count(episode),
+        "step_count": len(episode.steps),
         "metadata": dict(episode.metadata),
     }
 
 
 def _deserialize_benchmark_cache_episode(payload: dict[str, Any]) -> EpisodeRecord:
     winner = payload.get("winner")
-    metadata = dict(payload.get("metadata", {}))
-    raw_step_count = payload.get("step_count")
-    if raw_step_count is not None:
-        try:
-            metadata.setdefault("cached_step_count", max(0, int(raw_step_count)))
-        except (TypeError, ValueError):
-            pass
-    metadata.setdefault("cached_episode_summary", True)
     return EpisodeRecord(
         matchup=str(payload["matchup"]),
         seed=payload.get("seed"),
@@ -586,7 +577,7 @@ def _deserialize_benchmark_cache_episode(payload: dict[str, Any]) -> EpisodeReco
         steps=(),
         final_state=_cached_benchmark_final_state(winner if winner in {0, 1} else None),
         final_state_json=None,
-        metadata=metadata,
+        metadata=dict(payload.get("metadata", {})),
     )
 
 
@@ -599,25 +590,9 @@ def _append_benchmark_cache_episodes(path: Path, episodes: Sequence[EpisodeRecor
             handle.write("\n")
 
 
-def _rewrite_benchmark_cache_episodes(path: Path, episodes: Sequence[EpisodeRecord]) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(f"{destination.name}.compact.tmp")
-    try:
-        with temp_path.open("w", encoding="utf-8") as handle:
-            for episode in episodes:
-                handle.write(json.dumps(_serialize_benchmark_cache_episode(episode), sort_keys=True))
-                handle.write("\n")
-        temp_path.replace(destination)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-
-
 def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
     source = Path(path)
     cached: list[EpisodeRecord] = []
-    needs_compaction = False
     if not source.exists():
         return cached
     with source.open("r", encoding="utf-8") as handle:
@@ -634,7 +609,6 @@ def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
                         f"path={source} line={line_number} reason=truncated_tail_record skipped=True",
                         flush=True,
                     )
-                    needs_compaction = True
                     break
                 raise ValueError(
                     f"Malformed benchmark cache record at {source}:{line_number}"
@@ -645,7 +619,6 @@ def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
                     continue
                 if "final_state" in payload:
                     cached.append(deserialize_episode_record(payload))
-                    needs_compaction = True
                     continue
             except Exception as exc:
                 raise ValueError(
@@ -655,8 +628,6 @@ def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
                 f"Unsupported benchmark cache record at {source}:{line_number} "
                 f"keys={sorted(payload.keys())}"
             )
-    if needs_compaction and cached:
-        _rewrite_benchmark_cache_episodes(source, cached)
     return cached
 
 
@@ -2193,7 +2164,7 @@ def run_ppo_managed_loop(
                 details={
                     "last_matchup": episode.matchup,
                     "last_winner": episode.winner,
-                    "last_steps": episode_step_count(episode),
+                    "last_steps": len(episode.steps),
                     "last_truncated": bool(episode.metadata.get("truncated")),
                 },
             )
@@ -2228,7 +2199,7 @@ def run_ppo_managed_loop(
                 details={
                     "last_matchup": episode.matchup,
                     "last_winner": episode.winner,
-                    "last_steps": episode_step_count(episode),
+                    "last_steps": len(episode.steps),
                     "last_truncated": bool(episode.metadata.get("truncated")),
                     "last_opponent": opponent_label,
                 },

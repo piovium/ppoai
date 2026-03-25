@@ -101,10 +101,7 @@ class PpoAgent:
             else:
                 search_fallback_reason = "search_unavailable"
         selected_action_code = int(context.legal_low_level_codes[action_index])
-        selected_logprob = evaluation.get("selected_logprob")
-        if selected_logprob is None:
-            selected_logprob = float(evaluation["log_probs"][action_index])
-        executed_logprob = float(selected_logprob)
+        executed_logprob = float(evaluation["log_probs"][action_index])
         if search_decision is not None and search_decision.transformed_policy:
             probability = max(1.0e-8, float(search_decision.transformed_policy[action_index]))
             executed_logprob = float(torch.log(torch.tensor(probability)).item())
@@ -214,11 +211,9 @@ class PpoAgent:
                 ),
                 sample=sample,
                 temperature=temperature,
-                return_details=False,
             )
             return {
                 "action_index": int(result.action_index),
-                "selected_logprob": float(result.selected_logprob),
                 "log_probs": tuple(float(value) for value in result.log_probs),
                 "partial_value": float(result.partial_value),
                 "policy_entropy": float(result.policy_entropy),
@@ -269,7 +264,6 @@ class PpoAgent:
 
         return {
             "action_index": action_index,
-            "selected_logprob": float(log_probs[0, action_index].item()),
             "log_probs": tuple(float(value) for value in log_probs[0].detach().cpu().tolist()),
             "partial_value": float(output.partial_value[0].item()),
             "policy_entropy": float((-(probs * log_probs).sum(dim=-1)).item()),

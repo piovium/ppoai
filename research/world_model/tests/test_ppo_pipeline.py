@@ -23,6 +23,7 @@ from gitcg_world_model.ppo_pipeline import (
     _resolve_initial_checkpoint,
     _round_base_checkpoint,
     _safe_candidate_epochs,
+    _serialize_benchmark_cache_episode,
     _shortlist_candidate_epochs,
     run_ppo_managed_loop,
 )
@@ -316,6 +317,8 @@ class PpoPipelineTests(unittest.TestCase):
         self.assertEqual(tuple(item.seed for item in cached), (0, 1, 2, 3))
         self.assertEqual(cached[0].final_state.phase, "test")
         self.assertEqual(cached[2].final_state.phase, "benchmark_cache")
+        self.assertEqual(cached[2].metadata["cached_step_count"], 0)
+        self.assertEqual(_serialize_benchmark_cache_episode(cached[2])["step_count"], 0)
 
     def test_load_benchmark_cache_episodes_ignores_truncated_tail_record(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -330,6 +333,27 @@ class PpoPipelineTests(unittest.TestCase):
             cached = _load_benchmark_cache_episodes(output_path)
 
         self.assertEqual(tuple(item.seed for item in cached), (0,))
+
+    def test_load_benchmark_cache_episodes_preserves_compact_step_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "compact_benchmark_cache.jsonl"
+            episode = _dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=7)
+            episode = EpisodeRecord(
+                matchup=episode.matchup,
+                seed=episode.seed,
+                winner=episode.winner,
+                steps=(object(),) * 5,
+                final_state=episode.final_state,
+                final_state_json=episode.final_state_json,
+                metadata=episode.metadata,
+            )
+            _append_benchmark_cache_episodes(output_path, [episode])
+
+            cached = _load_benchmark_cache_episodes(output_path)
+
+        self.assertEqual(len(cached[0].steps), 0)
+        self.assertEqual(cached[0].metadata["cached_step_count"], 5)
+        self.assertEqual(_serialize_benchmark_cache_episode(cached[0])["step_count"], 5)
 
     def test_benchmark_eval_workers_uses_safe_default_cap_and_env_override(self):
         with patch.dict(os.environ, {}, clear=False):

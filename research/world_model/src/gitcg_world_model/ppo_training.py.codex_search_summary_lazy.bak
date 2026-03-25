@@ -44,8 +44,6 @@ from .sepot_search import (
 )
 from .schema import DecisionContext, EnvConfig, EpisodeRecord, TrajectoryStep
 
-_SEARCH_CONTEXT_SUMMARY_DIM = 16
-
 
 def _jsonable_semantic_value(value):
     if isinstance(value, tuple):
@@ -544,8 +542,6 @@ def _build_player_sequences(
     search_config = SePotSearchConfig()
     zero_belief_histogram = tuple(0.0 for _ in range(encoder.belief_histogram_dim))
     zero_belief_deck_histogram = tuple(0.0 for _ in range(encoder.belief_remaining_deck_histogram_dim))
-    zero_search_range_summary = tuple(0.0 for _ in range((encoder.belief_histogram_dim * 2) + 12))
-    zero_search_context_summary = tuple(0.0 for _ in range(_SEARCH_CONTEXT_SUMMARY_DIM))
     for step_index, step in enumerate(episode.steps):
         context = _context_from_step(step, episode_metadata=episode.metadata)
         is_trainable = bool(step.metadata.get("ppo_trainable", True))
@@ -563,33 +559,16 @@ def _build_player_sequences(
                 opponent_deck_name=opponent_deck_name,
                 opponent_public_dice_count=tracker.opponent_public_dice_count(context),
             )
-            search_teacher_weight = float(step.metadata.get("search_teacher_weight", 0.0))
-            search_self_range_summary = zero_search_range_summary
-            search_opponent_range_summary = zero_search_range_summary
-            search_context_summary = zero_search_context_summary
-            if search_teacher_weight > 0.0:
-                budget = phase_budget_for_context(context, config=search_config)
-                public_belief = build_public_belief_state(
-                    context=context,
-                    tracker=tracker,
-                    card_vocabulary=encoder.config.card_vocabulary,
-                    opponent_deck_name=(opponent_deck_name or "unknown"),
-                    belief_histogram=zero_belief_histogram,
-                    belief_remaining_deck_histogram=zero_belief_deck_histogram,
-                    belief_samples=budget.belief_samples,
-                )
-                search_self_range_summary = range_summary(
-                    public_belief.self_range,
-                    card_vocabulary=encoder.config.card_vocabulary,
-                )
-                search_opponent_range_summary = range_summary(
-                    public_belief.opponent_range,
-                    card_vocabulary=encoder.config.card_vocabulary,
-                )
-                search_context_summary = state_search_context_summary(
-                    context=context,
-                    budget=budget,
-                )
+            budget = phase_budget_for_context(context, config=search_config)
+            public_belief = build_public_belief_state(
+                context=context,
+                tracker=tracker,
+                card_vocabulary=encoder.config.card_vocabulary,
+                opponent_deck_name=(opponent_deck_name or "unknown"),
+                belief_histogram=zero_belief_histogram,
+                belief_remaining_deck_histogram=zero_belief_deck_histogram,
+                belief_samples=budget.belief_samples,
+            )
             encoded_steps[step_index] = {
                 "encoded": encoded,
                 "action_index": _selected_action_index(step),
@@ -597,9 +576,18 @@ def _build_player_sequences(
                 if include_old_logprob
                 else 0.0,
                 "value": float(step.metadata.get("partial_value", 0.0)),
-                "search_self_range_summary": search_self_range_summary,
-                "search_opponent_range_summary": search_opponent_range_summary,
-                "search_context_summary": search_context_summary,
+                "search_self_range_summary": range_summary(
+                    public_belief.self_range,
+                    card_vocabulary=encoder.config.card_vocabulary,
+                ),
+                "search_opponent_range_summary": range_summary(
+                    public_belief.opponent_range,
+                    card_vocabulary=encoder.config.card_vocabulary,
+                ),
+                "search_context_summary": state_search_context_summary(
+                    context=context,
+                    budget=budget,
+                ),
             }
             trainable_by_player[step.acting_player].append(step_index)
         for tracker in public_trackers.values():

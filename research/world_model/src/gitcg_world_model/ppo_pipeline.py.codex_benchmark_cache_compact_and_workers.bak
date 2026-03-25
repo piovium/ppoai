@@ -116,7 +116,7 @@ _PHASE_RANKS: dict[str, int] = {
 _BENCHMARK_CACHE_FORMAT = "benchmark_episode_summary_v1"
 _BENCHMARK_WORKERS_ENV = "P2SRO_BENCHMARK_WORKERS"
 _BENCHMARK_CACHE_FLUSH_ENV = "P2SRO_BENCHMARK_CACHE_FLUSH_THRESHOLD"
-_DEFAULT_BENCHMARK_WORKER_CAP = 3
+_DEFAULT_BENCHMARK_WORKER_CAP = 2
 _DEFAULT_BENCHMARK_CACHE_FLUSH = 8
 _EMPTY_CACHE_PLAYER = PlayerSnapshot(
     active_character_id=None,
@@ -599,25 +599,9 @@ def _append_benchmark_cache_episodes(path: Path, episodes: Sequence[EpisodeRecor
             handle.write("\n")
 
 
-def _rewrite_benchmark_cache_episodes(path: Path, episodes: Sequence[EpisodeRecord]) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(f"{destination.name}.compact.tmp")
-    try:
-        with temp_path.open("w", encoding="utf-8") as handle:
-            for episode in episodes:
-                handle.write(json.dumps(_serialize_benchmark_cache_episode(episode), sort_keys=True))
-                handle.write("\n")
-        temp_path.replace(destination)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-
-
 def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
     source = Path(path)
     cached: list[EpisodeRecord] = []
-    needs_compaction = False
     if not source.exists():
         return cached
     with source.open("r", encoding="utf-8") as handle:
@@ -634,7 +618,6 @@ def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
                         f"path={source} line={line_number} reason=truncated_tail_record skipped=True",
                         flush=True,
                     )
-                    needs_compaction = True
                     break
                 raise ValueError(
                     f"Malformed benchmark cache record at {source}:{line_number}"
@@ -645,7 +628,6 @@ def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
                     continue
                 if "final_state" in payload:
                     cached.append(deserialize_episode_record(payload))
-                    needs_compaction = True
                     continue
             except Exception as exc:
                 raise ValueError(
@@ -655,8 +637,6 @@ def _load_benchmark_cache_episodes(path: Path) -> list[EpisodeRecord]:
                 f"Unsupported benchmark cache record at {source}:{line_number} "
                 f"keys={sorted(payload.keys())}"
             )
-    if needs_compaction and cached:
-        _rewrite_benchmark_cache_episodes(source, cached)
     return cached
 
 

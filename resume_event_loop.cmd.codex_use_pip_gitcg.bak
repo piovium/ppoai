@@ -1,0 +1,78 @@
+@echo off
+setlocal
+
+set "REPO_ROOT=%~dp0"
+if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
+set "WORKSPACE=D:\WorldModelTemp\ppo_oracle_search_psro_live_stable_actions_rerollfix"
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$repoRoot = [System.IO.Path]::GetFullPath('%REPO_ROOT%');" ^
+  "$workspace = '%WORKSPACE%';" ^
+  "$manifestPath = Join-Path $workspace 'run_manifest.json';" ^
+  "$running = $false;" ^
+  "if (Test-Path $manifestPath) {" ^
+  "  try { $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json } catch { $manifest = $null };" ^
+  "  if ($manifest -and $manifest.workspace -eq $workspace -and $manifest.pid) {" ^
+  "    $proc = Get-Process -Id $manifest.pid -ErrorAction SilentlyContinue;" ^
+  "    if ($proc) {" ^
+  "      $running = $true;" ^
+  "      Write-Host ('Already running. PID=' + $manifest.pid);" ^
+  "    }" ^
+  "  }" ^
+  "}" ^
+  "if (-not $running) {" ^
+  "  New-Item -ItemType Directory -Force -Path $workspace | Out-Null;" ^
+  "  $ts = Get-Date -Format 'yyyyMMdd_HHmmss';" ^
+  "  $stdout = Join-Path $workspace ('stdout_resume_' + $ts + '.log');" ^
+  "  $stderr = Join-Path $workspace ('stderr_resume_' + $ts + '.log');" ^
+  "  $pyPaths = @(" ^
+  "    (Join-Path $repoRoot 'packages\pybinding\src')," ^
+  "    (Join-Path $repoRoot 'research\world_model\src')" ^
+  "  );" ^
+  "  $env:PYTHONPATH = [string]::Join(';', $pyPaths);" ^
+  "  Remove-Item Env:PYTORCH_CUDA_ALLOC_CONF -ErrorAction SilentlyContinue;" ^
+  "  if (-not $IsWindows) { $env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True' }" ^
+  "  $args = @(" ^
+  "    'research/world_model/scripts/run_ppo_main_loop.py'," ^
+  "    '--workspace', $workspace," ^
+  "    '--rounds', '100'," ^
+  "    '--bootstrap-episodes-per-matchup', '8'," ^
+  "    '--self-play-episodes-per-matchup', '8'," ^
+  "    '--max-decisions', '512'," ^
+  "    '--draw-penalty', '1.0'," ^
+  "    '--batch-size', '64'," ^
+  "    '--micro-batch-size', '8'," ^
+  "    '--epochs', '12'," ^
+  "    '--bootstrap-epochs', '5'," ^
+  "    '--learning-rate', '0.0003'," ^
+  "    '--weight-decay', '0.0001'," ^
+  "    '--grad-clip-norm', '1.0'," ^
+  "    '--gamma', '0.99'," ^
+  "    '--gae-lambda', '0.95'," ^
+  "    '--entropy-coef', '0.01'," ^
+  "    '--policy-coef', '4.0'," ^
+  "    '--value-coef', '0.5'," ^
+  "    '--belief-coef', '0.2'," ^
+  "    '--oracle-coef', '0.2'," ^
+  "    '--reference-kl-coef', '0.007'," ^
+  "    '--target-kl-low', '0.01'," ^
+  "    '--target-kl-high', '0.05'," ^
+  "    '--use-amp'," ^
+  "    '--device', 'cuda'," ^
+  "    '--workers', '6'," ^
+  "    '--inference-max-batch-size', '192'," ^
+  "    '--inference-max-wait-ms', '4'," ^
+  "    '--retain-round-directories', '6'," ^
+  "    '--resume'," ^
+  "    '--status-print'" ^
+  "  );" ^
+  "  $proc = Start-Process python -ArgumentList $args -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru;" ^
+  "  Write-Host ('Started PID=' + $proc.Id);" ^
+  "  Write-Host ('stdout=' + $stdout);" ^
+  "  Write-Host ('stderr=' + $stderr);" ^
+  "}"
+
+echo.
+echo Workspace: %WORKSPACE%
+echo Double-click this file again after an unexpected exit to resume.
+pause
