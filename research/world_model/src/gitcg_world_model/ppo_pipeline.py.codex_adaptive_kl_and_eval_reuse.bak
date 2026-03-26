@@ -116,8 +116,8 @@ _PHASE_RANKS: dict[str, int] = {
 _BENCHMARK_CACHE_FORMAT = "benchmark_episode_summary_v1"
 _BENCHMARK_WORKERS_ENV = "P2SRO_BENCHMARK_WORKERS"
 _BENCHMARK_CACHE_FLUSH_ENV = "P2SRO_BENCHMARK_CACHE_FLUSH_THRESHOLD"
-_DEFAULT_BENCHMARK_WORKER_CAP = 1
-_DEFAULT_BENCHMARK_CACHE_FLUSH = 1
+_DEFAULT_BENCHMARK_WORKER_CAP = 3
+_DEFAULT_BENCHMARK_CACHE_FLUSH = 8
 _EMPTY_CACHE_PLAYER = PlayerSnapshot(
     active_character_id=None,
     characters=(),
@@ -584,10 +584,9 @@ def _benchmark_eval_workers(requested_workers: int) -> int:
         except ValueError:
             override = _DEFAULT_BENCHMARK_WORKER_CAP
         return min(requested, override)
-    # Keep benchmark evaluation single-worker by default. This path is more
-    # sensitive to model-load contention and native stalls than self-play, and
-    # stability matters more than squeezing a small amount of extra parallelism
-    # out of selection / payoff bookkeeping.
+    # Selection / payoff evaluation previously forced single-worker execution to
+    # avoid JS heap OOMs. Keep the cap conservative, but allow a small amount of
+    # parallelism now that benchmark caches are compact.
     return min(requested, _DEFAULT_BENCHMARK_WORKER_CAP)
 
 
@@ -1355,7 +1354,6 @@ def _collect_recent_replay_paths(
     current_round: int,
     replay_round_window: int,
     include_br: bool,
-    include_eval: bool = True,
 ) -> list[Path]:
     paths: list[Path] = []
     round_start = max(1, current_round - replay_round_window)
@@ -1368,14 +1366,6 @@ def _collect_recent_replay_paths(
             br_path = round_dir / "br_self_play.jsonl"
             if br_path.exists():
                 paths.append(br_path)
-        if include_eval:
-            for eval_path in (
-                _selection_replay_path(round_dir / "train"),
-                _selection_replay_path(round_dir / "br_train"),
-                _payoff_replay_path(round_dir),
-            ):
-                if eval_path.exists():
-                    paths.append(eval_path)
     return paths
 
 
@@ -1517,82 +1507,6 @@ def _load_recent_p2sro_replay_episodes(
             include_br=True,
         ),
         label="recent_p2sro_replay",
-    )
-
-
-def _selection_replay_path(train_dir: Path) -> Path:
-    return Path(train_dir) / "selection_replay.jsonl"
-
-
-def _payoff_replay_path(round_dir: Path) -> Path:
-    return Path(round_dir) / "payoff_replay.jsonl"
-
-
-def _replay_episode_key(episode: EpisodeRecord) -> tuple[str, int | None, str | None]:
-    metadata = dict(episode.metadata or {})
-    opponent_policy_id = metadata.get("opponent_policy_id")
-    return (
-        str(episode.matchup),
-        episode.seed,
-        (str(opponent_policy_id) if opponent_policy_id is not None else None),
-    )
-
-
-def _episode_has_learning_content(episode: EpisodeRecord) -> bool:
-    metadata = dict(episode.metadata or {})
-    if bool(metadata.get("cached_episode_summary")):
-        return False
-    return bool(getattr(episode, "steps", ()))
-
-
-def _load_replay_episode_keys(path: Path) -> set[tuple[str, int | None, str | None]]:
-    source = Path(path)
-    if not source.exists():
-        return set()
-    return {
-        _replay_episode_key(episode)
-        for episode in load_episode_records(source)
-        if _episode_has_learning_content(episode)
-    }
-
-
-def _append_unique_replay_episodes(
-    path: Path,
-    episodes: Sequence[EpisodeRecord],
-    *,
-    existing_keys: set[tuple[str, int | None, str | None]] | None = None,
-) -> int:
-    destination = Path(path)
-    if not episodes:
-        return 0
-    seen = existing_keys if existing_keys is not None else _load_replay_episode_keys(destination)
-    pending: list[EpisodeRecord] = []
-    for episode in episodes:
-        if not _episode_has_learning_content(episode):
-            continue
-        key = _replay_episode_key(episode)
-        if key in seen:
-            continue
-        seen.add(key)
-        pending.append(episode)
-    if not pending:
-        return 0
-    append_episode_records(destination, pending)
-    return len(pending)
-
-
-def _append_replay_episode_if_useful(
-    path: Path | None,
-    episode: EpisodeRecord,
-    *,
-    existing_keys: set[tuple[str, int | None, str | None]] | None = None,
-) -> int:
-    if path is None:
-        return 0
-    return _append_unique_replay_episodes(
-        path,
-        (episode,),
-        existing_keys=existing_keys,
     )
 
 
@@ -1839,13 +1753,11 @@ def _evaluate_checkpoint_against_population(
     episodes_per_matchup: int,
     seed_start: int,
     output_dir: Path | None = None,
-    replay_output_path: Path | None = None,
     progress_callback: Callable[[int, int, EpisodeRecord, str], None] | None = None,
 ) -> tuple[float, dict[str, float], tuple[dict[str, object], ...]]:
     per_policy_payoffs: dict[str, float] = {}
     matchup_payloads: list[dict[str, object]] = []
     meta_expected_payoff = 0.0
-    replay_keys = _load_replay_episode_keys(replay_output_path) if replay_output_path is not None else None
     for policy_index, opponent_entry in enumerate(frozen_population):
         jobs: list[_EpisodeJob] = []
         for episode_index in range(episodes_per_matchup):
@@ -1902,20 +1814,6 @@ def _evaluate_checkpoint_against_population(
             else None
         )
         flush_threshold = _benchmark_eval_flush_threshold(len(jobs))
-        def benchmark_progress_callback(
-            done: int,
-            total: int,
-            result: _EpisodeJobResult,
-            *,
-            opponent_policy_id: str = opponent_entry.policy_id,
-        ) -> None:
-            _append_replay_episode_if_useful(
-                replay_output_path,
-                result.episode,
-                existing_keys=replay_keys,
-            )
-            if progress_callback is not None:
-                progress_callback(done, total, result.episode, opponent_policy_id)
         episodes = _execute_episode_jobs(
             config=env_config,
             jobs=jobs,
@@ -1923,9 +1821,9 @@ def _evaluate_checkpoint_against_population(
             workers=_benchmark_eval_workers(workers),
             output_path=eval_output_path,
             progress_callback=(
-                benchmark_progress_callback
-                if (progress_callback is not None or replay_output_path is not None)
-                else None
+                (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                    progress_callback(done, total, result.episode, opponent_policy_id))
+                if progress_callback is not None else None
             ),
             flush_threshold=flush_threshold,
             load_persisted_episodes=_load_benchmark_cache_episodes,
@@ -1994,7 +1892,6 @@ def _select_active_slot_checkpoint(
         raise RuntimeError("no checkpoint candidates available for active slot selection")
     bundle_cache = cache if cache is not None else {}
     candidates: list[_SlotCandidateEvaluation] = []
-    selection_replay_path = _selection_replay_path(train_dir)
     for epoch in shortlist_epochs:
         checkpoint_path = _candidate_checkpoint_path(train_dir, epoch)
         if not checkpoint_path.exists():
@@ -2015,7 +1912,6 @@ def _select_active_slot_checkpoint(
             episodes_per_matchup=benchmark_config.episodes_per_matchup,
             seed_start=seed_start + epoch * 1_000,
             output_dir=selection_cache_dir,
-            replay_output_path=selection_replay_path,
             progress_callback=(
                 (lambda done, total, episode, opponent_policy_id, eval_epoch=epoch:
                     print_episode_progress(
@@ -2063,11 +1959,6 @@ def _select_active_slot_checkpoint(
             "selected_checkpoint": selected.checkpoint_path,
             "expected_payoff_vs_meta": selected.expected_payoff_vs_meta,
             "meta_policy_probabilities": dict(selected.meta_policy_probabilities),
-            "selection_replay_path": (
-                str(selection_replay_path)
-                if selection_replay_path.exists()
-                else None
-            ),
             "candidates": [
                 {
                     "epoch": item.epoch,
@@ -2081,108 +1972,6 @@ def _select_active_slot_checkpoint(
         },
     )
     return deployment_checkpoint, selected.epoch, selection_summary_path, selected
-
-
-def _candidate_evaluation_to_payoff_results(
-    candidate: _SlotCandidateEvaluation,
-) -> dict[str, PayoffResult]:
-    grouped: dict[str, list[dict[str, object]]] = {}
-    for payload in candidate.matchup_results:
-        opponent_policy_id = payload.get("opponent_policy_id")
-        if opponent_policy_id is None:
-            continue
-        grouped.setdefault(str(opponent_policy_id), []).append(dict(payload))
-
-    payoff_results: dict[str, PayoffResult] = {}
-    for opponent_policy_id, rows in grouped.items():
-        wins = 0
-        losses = 0
-        draws = 0
-        episodes = 0
-        per_matchup_results: list[dict[str, object]] = []
-        for row in rows:
-            matchup_episodes = int(row.get("episodes", 0))
-            matchup_wins = int(row.get("wins", 0))
-            matchup_losses = int(row.get("losses", 0))
-            matchup_draws = int(row.get("draws", 0))
-            episodes += matchup_episodes
-            wins += matchup_wins
-            losses += matchup_losses
-            draws += matchup_draws
-            per_matchup_results.append(
-                {
-                    "matchup": str(row.get("matchup", "")),
-                    "episodes": matchup_episodes,
-                    "wins": matchup_wins,
-                    "losses": matchup_losses,
-                    "draws": matchup_draws,
-                    "payoff": float(
-                        row.get(
-                            "payoff",
-                            _payoff_from_counts(
-                                wins=matchup_wins,
-                                losses=matchup_losses,
-                                draws=matchup_draws,
-                                episodes=matchup_episodes,
-                            ),
-                        )
-                    ),
-                }
-            )
-        payoff_results[opponent_policy_id] = PayoffResult(
-            episodes=episodes,
-            wins=wins,
-            losses=losses,
-            draws=draws,
-            payoff=float(
-                candidate.per_policy_payoffs.get(
-                    opponent_policy_id,
-                    _payoff_from_counts(
-                        wins=wins,
-                        losses=losses,
-                        draws=draws,
-                        episodes=episodes,
-                    ),
-                )
-            ),
-            matchup_results=tuple(per_matchup_results),
-        )
-    return payoff_results
-
-
-def _mirror_payoff_result(result: PayoffResult) -> PayoffResult:
-    return PayoffResult(
-        episodes=int(result.episodes),
-        wins=int(result.losses),
-        losses=int(result.wins),
-        draws=int(result.draws),
-        payoff=float(
-            _payoff_from_counts(
-                wins=int(result.losses),
-                losses=int(result.wins),
-                draws=int(result.draws),
-                episodes=int(result.episodes),
-            )
-        ),
-        matchup_results=tuple(
-            {
-                "matchup": str(item["matchup"]),
-                "episodes": int(item["episodes"]),
-                "wins": int(item["losses"]),
-                "losses": int(item["wins"]),
-                "draws": int(item["draws"]),
-                "payoff": float(
-                    _payoff_from_counts(
-                        wins=int(item["losses"]),
-                        losses=int(item["wins"]),
-                        draws=int(item["draws"]),
-                        episodes=int(item["episodes"]),
-                    )
-                ),
-            }
-            for item in result.matchup_results
-        ),
-    )
 
 
 def _update_p2sro_payoff_matrix(
@@ -2200,37 +1989,14 @@ def _update_p2sro_payoff_matrix(
     episodes_per_matchup: int,
     seed_start: int,
     cache_dir: Path | None = None,
-    replay_output_path: Path | None = None,
-    seed_results: dict[str, PayoffResult] | None = None,
     round_index: int | None = None,
     enable_status_print: bool = False,
 ) -> dict[str, float]:
     bundle_cache = cache if cache is not None else {}
     per_policy_payoffs: dict[str, float] = {}
-    seeded_payoff_results = dict(seed_results or {})
-    replay_keys = _load_replay_episode_keys(replay_output_path) if replay_output_path is not None else None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     for opponent_index, opponent_entry in enumerate(manager.frozen_entries()):
-        seeded_result = seeded_payoff_results.get(opponent_entry.policy_id)
-        if seeded_result is not None:
-            per_policy_payoffs[opponent_entry.policy_id] = float(seeded_result.payoff)
-            manager.payoff_matrix.set_pair(
-                row_policy_id=candidate_policy_id,
-                col_policy_id=opponent_entry.policy_id,
-                row_result=seeded_result,
-                col_result=_mirror_payoff_result(seeded_result),
-            )
-            if enable_status_print:
-                print(
-                    "[p2sro-payoff-reuse] "
-                    f"candidate={candidate_policy_id} "
-                    f"opponent={opponent_entry.policy_id} "
-                    f"episodes={seeded_result.episodes} "
-                    f"payoff={seeded_result.payoff:.4f}",
-                    flush=True,
-                )
-            continue
         jobs: list[_EpisodeJob] = []
         per_matchup_results: list[dict[str, object]] = []
         for episode_index in range(episodes_per_matchup):
@@ -2287,27 +2053,6 @@ def _update_p2sro_payoff_matrix(
             else None
         )
         flush_threshold = _benchmark_eval_flush_threshold(len(jobs))
-        def payoff_progress_callback(
-            done: int,
-            total: int,
-            result: _EpisodeJobResult,
-            *,
-            opponent_policy_id: str = opponent_entry.policy_id,
-        ) -> None:
-            _append_replay_episode_if_useful(
-                replay_output_path,
-                result.episode,
-                existing_keys=replay_keys,
-            )
-            if enable_status_print:
-                print_episode_progress(
-                    label=f"p2sro-payoff-{candidate_policy_id}",
-                    round_index=round_index or 0,
-                    completed=done,
-                    total=total,
-                    episode=result.episode,
-                    extra=f"frozen:{opponent_policy_id}",
-                )
         episodes = _execute_episode_jobs(
             config=env_config,
             jobs=jobs,
@@ -2315,9 +2060,16 @@ def _update_p2sro_payoff_matrix(
             workers=_benchmark_eval_workers(workers),
             output_path=payoff_output_path,
             progress_callback=(
-                payoff_progress_callback
-                if (enable_status_print or replay_output_path is not None)
-                else None
+                (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                    print_episode_progress(
+                        label=f"p2sro-payoff-{candidate_policy_id}",
+                        round_index=round_index or 0,
+                        completed=done,
+                        total=total,
+                        episode=result.episode,
+                        extra=f"frozen:{opponent_policy_id}",
+                    ))
+                if enable_status_print else None
             ),
             flush_threshold=flush_threshold,
             load_persisted_episodes=_load_benchmark_cache_episodes,
@@ -2990,7 +2742,6 @@ def run_ppo_managed_loop(
         self_play_episodes = ()
         replay_episodes = ()
         gc.collect()
-        main_selection_replay_path = _selection_replay_path(train_dir)
         br_slot_state = manager.set_active_slot_seed(
             slot_name="active_br_slot",
             lineage="best_response",
@@ -3052,11 +2803,6 @@ def run_ppo_managed_loop(
                 analytics=br_self_play_analysis,
             )
             main_phase_episodes = load_episode_records(self_play_path)
-            main_selection_replay_episodes = (
-                tuple(load_episode_records(main_selection_replay_path))
-                if main_selection_replay_path.exists()
-                else ()
-            )
             recent_replay_episodes = _load_recent_p2sro_replay_episodes(
                 workspace_path,
                 current_round=round_index,
@@ -3064,12 +2810,10 @@ def run_ppo_managed_loop(
             )
             br_replay_episodes = _compose_replay_buffer(
                 main_phase_episodes,
-                main_selection_replay_episodes,
                 recent_replay_episodes,
                 label="br_train_replay",
             )
             main_phase_episodes = ()
-            main_selection_replay_episodes = ()
             recent_replay_episodes = ()
             gc.collect()
             br_train_artifacts = train_ppo_from_episodes(
@@ -3161,11 +2905,6 @@ def run_ppo_managed_loop(
             br_self_play_analysis = analyze_episode_records(br_self_play_episodes, player=0)
             br_replay_episodes = _compose_replay_buffer(
                 load_episode_records(self_play_path),
-                (
-                    tuple(load_episode_records(main_selection_replay_path))
-                    if main_selection_replay_path.exists()
-                    else ()
-                ),
                 _load_recent_p2sro_replay_episodes(
                     workspace_path,
                     current_round=round_index,
@@ -3219,9 +2958,6 @@ def run_ppo_managed_loop(
             current_phase="round_finalize",
         )
         promoted_entries: list[PolicyEntry] = []
-        main_seed_payoff_results = _candidate_evaluation_to_payoff_results(selected_main_candidate)
-        br_seed_payoff_results = _candidate_evaluation_to_payoff_results(selected_br_candidate)
-        payoff_replay_path = _payoff_replay_path(round_dir)
         if manager.should_promote(lineage="main", candidate_payoff=selected_main_candidate.expected_payoff_vs_meta):
             promoted_main = manager.freeze_active_slot(
                 slot_name="active_main_slot",
@@ -3241,8 +2977,6 @@ def run_ppo_managed_loop(
                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
                 seed_start=seed_start + round_index * 50_000,
                 cache_dir=round_dir / "payoff_cache",
-                replay_output_path=payoff_replay_path,
-                seed_results=main_seed_payoff_results,
                 round_index=round_index,
                 enable_status_print=enable_status_print,
             )
@@ -3266,8 +3000,6 @@ def run_ppo_managed_loop(
                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
                 seed_start=seed_start + round_index * 60_000,
                 cache_dir=round_dir / "payoff_cache",
-                replay_output_path=payoff_replay_path,
-                seed_results=br_seed_payoff_results,
                 round_index=round_index,
                 enable_status_print=enable_status_print,
             )

@@ -8,6 +8,7 @@ import torch
 from gitcg_world_model.ppo_features import TokenObservationEncoder
 from gitcg_world_model.ppo_model import masked_log_softmax
 from gitcg_world_model.ppo_training import (
+    _adapt_reference_kl_coef,
     _action_efficiency_reward,
     _resolve_micro_batch_size,
     _select_aux_replay_chunks,
@@ -19,6 +20,28 @@ from gitcg_world_model.testsupport import encode_step_actions, materialize_legal
 
 
 class PpoTrainingTests(unittest.TestCase):
+    def test_adapt_reference_kl_coef_relaxes_when_kl_too_low(self):
+        adapted = _adapt_reference_kl_coef(
+            0.007,
+            approx_kl=0.001,
+            target_kl_low=0.01,
+            target_kl_high=0.05,
+            min_coef=1.0e-5,
+            max_coef=0.05,
+        )
+        self.assertLess(adapted, 0.007)
+
+    def test_adapt_reference_kl_coef_tightens_when_kl_too_high(self):
+        adapted = _adapt_reference_kl_coef(
+            0.007,
+            approx_kl=0.08,
+            target_kl_low=0.01,
+            target_kl_high=0.05,
+            min_coef=1.0e-5,
+            max_coef=0.05,
+        )
+        self.assertGreater(adapted, 0.007)
+
     def test_resolve_micro_batch_size_caps_large_cuda_models(self):
         size = _resolve_micro_batch_size(
             batch_size=64,

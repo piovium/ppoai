@@ -181,7 +181,6 @@ class PpoTrainingMetrics:
     policy_loss: float
     high_policy_loss: float
     fresh_policy_loss: float
-    reference_kl_coef: float
     reference_kl_loss: float
     value_loss: float
     replay_value_loss: float
@@ -771,35 +770,6 @@ def _select_aux_replay_chunks(chunks: Sequence[PpoTrainChunk]) -> tuple[PpoTrain
     )
 
 
-def _adapt_reference_kl_coef(
-    current_coef: float,
-    *,
-    approx_kl: float,
-    target_kl_low: float,
-    target_kl_high: float,
-    min_coef: float,
-    max_coef: float,
-) -> float:
-    if not math.isfinite(float(current_coef)):
-        return float(min_coef)
-    if not math.isfinite(float(approx_kl)):
-        return min(max_coef, max(min_coef, current_coef * 2.0))
-    if target_kl_low <= 0.0 or target_kl_high <= 0.0 or target_kl_low >= target_kl_high:
-        return min(max_coef, max(min_coef, current_coef))
-
-    next_coef = float(current_coef)
-    kl_value = float(approx_kl)
-    if kl_value < (target_kl_low * 0.5):
-        next_coef *= 0.5
-    elif kl_value < target_kl_low:
-        next_coef *= 0.8
-    elif kl_value > (target_kl_high * 2.0):
-        next_coef *= 2.0
-    elif kl_value > target_kl_high:
-        next_coef *= 1.5
-    return min(max_coef, max(min_coef, next_coef))
-
-
 def _fit_actor_critic(
     *,
     fresh_chunks: Sequence[PpoTrainChunk],
@@ -898,9 +868,6 @@ def _fit_actor_critic(
     replay_chunk_count = len(replay_chunks)
     static_ratios = _dataset_ratios(fresh_chunks=fresh_chunks, replay_chunks=replay_chunks)
     effective_epochs = int(epochs)
-    current_reference_kl_coef = float(reference_kl_coef if objective == "ppo" else 0.0)
-    min_reference_kl_coef = max(1.0e-5, current_reference_kl_coef * 0.125) if objective == "ppo" else 0.0
-    max_reference_kl_coef = max(current_reference_kl_coef * 8.0, 0.05) if objective == "ppo" else 0.0
 
     for epoch_index in range(epochs):
         main_metrics = _run_training_epoch(
@@ -919,7 +886,7 @@ def _fit_actor_critic(
             belief_coef=belief_coef,
             oracle_coef=oracle_coef,
             reference_model=reference_model,
-            reference_kl_coef=current_reference_kl_coef if objective == "ppo" else 0.0,
+            reference_kl_coef=reference_kl_coef if objective == "ppo" else 0.0,
         )
         replay_value_loss = 0.0
         replay_belief_loss = 0.0
@@ -955,7 +922,6 @@ def _fit_actor_critic(
             policy_loss=main_metrics["policy_loss"],
             high_policy_loss=main_metrics.get("high_policy_loss", 0.0),
             fresh_policy_loss=main_metrics["policy_loss"],
-            reference_kl_coef=current_reference_kl_coef if objective == "ppo" else 0.0,
             reference_kl_loss=main_metrics["reference_kl_loss"],
             value_loss=main_metrics["value_loss"],
             replay_value_loss=replay_value_loss,
@@ -1020,14 +986,6 @@ def _fit_actor_critic(
             if metrics.approx_kl > target_kl_high:
                 effective_epochs = epoch_number
                 break
-            current_reference_kl_coef = _adapt_reference_kl_coef(
-                current_reference_kl_coef,
-                approx_kl=metrics.approx_kl,
-                target_kl_low=target_kl_low,
-                target_kl_high=target_kl_high,
-                min_coef=min_reference_kl_coef,
-                max_coef=max_reference_kl_coef,
-            )
     model.load_state_dict(best_state)
     save_ppo_deployment_checkpoint(
         deployment_checkpoint,

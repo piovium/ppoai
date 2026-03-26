@@ -116,8 +116,8 @@ _PHASE_RANKS: dict[str, int] = {
 _BENCHMARK_CACHE_FORMAT = "benchmark_episode_summary_v1"
 _BENCHMARK_WORKERS_ENV = "P2SRO_BENCHMARK_WORKERS"
 _BENCHMARK_CACHE_FLUSH_ENV = "P2SRO_BENCHMARK_CACHE_FLUSH_THRESHOLD"
-_DEFAULT_BENCHMARK_WORKER_CAP = 1
-_DEFAULT_BENCHMARK_CACHE_FLUSH = 1
+_DEFAULT_BENCHMARK_WORKER_CAP = 3
+_DEFAULT_BENCHMARK_CACHE_FLUSH = 8
 _EMPTY_CACHE_PLAYER = PlayerSnapshot(
     active_character_id=None,
     characters=(),
@@ -584,10 +584,9 @@ def _benchmark_eval_workers(requested_workers: int) -> int:
         except ValueError:
             override = _DEFAULT_BENCHMARK_WORKER_CAP
         return min(requested, override)
-    # Keep benchmark evaluation single-worker by default. This path is more
-    # sensitive to model-load contention and native stalls than self-play, and
-    # stability matters more than squeezing a small amount of extra parallelism
-    # out of selection / payoff bookkeeping.
+    # Selection / payoff evaluation previously forced single-worker execution to
+    # avoid JS heap OOMs. Keep the cap conservative, but allow a small amount of
+    # parallelism now that benchmark caches are compact.
     return min(requested, _DEFAULT_BENCHMARK_WORKER_CAP)
 
 
@@ -1581,21 +1580,6 @@ def _append_unique_replay_episodes(
     return len(pending)
 
 
-def _append_replay_episode_if_useful(
-    path: Path | None,
-    episode: EpisodeRecord,
-    *,
-    existing_keys: set[tuple[str, int | None, str | None]] | None = None,
-) -> int:
-    if path is None:
-        return 0
-    return _append_unique_replay_episodes(
-        path,
-        (episode,),
-        existing_keys=existing_keys,
-    )
-
-
 _SELF_PLAY_INVALID_TERMINAL_RETRIES_ENV = "GITCG_SELF_PLAY_INVALID_TERMINAL_RETRIES"
 _SELF_PLAY_INVALID_TERMINAL_RETRIES_DEFAULT = 8
 _SELF_PLAY_RETRY_SEED_STRIDE = 1_000_003
@@ -1902,20 +1886,6 @@ def _evaluate_checkpoint_against_population(
             else None
         )
         flush_threshold = _benchmark_eval_flush_threshold(len(jobs))
-        def benchmark_progress_callback(
-            done: int,
-            total: int,
-            result: _EpisodeJobResult,
-            *,
-            opponent_policy_id: str = opponent_entry.policy_id,
-        ) -> None:
-            _append_replay_episode_if_useful(
-                replay_output_path,
-                result.episode,
-                existing_keys=replay_keys,
-            )
-            if progress_callback is not None:
-                progress_callback(done, total, result.episode, opponent_policy_id)
         episodes = _execute_episode_jobs(
             config=env_config,
             jobs=jobs,
@@ -1923,14 +1893,20 @@ def _evaluate_checkpoint_against_population(
             workers=_benchmark_eval_workers(workers),
             output_path=eval_output_path,
             progress_callback=(
-                benchmark_progress_callback
-                if (progress_callback is not None or replay_output_path is not None)
-                else None
+                (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                    progress_callback(done, total, result.episode, opponent_policy_id))
+                if progress_callback is not None else None
             ),
             flush_threshold=flush_threshold,
             load_persisted_episodes=_load_benchmark_cache_episodes,
             persist_episodes=_append_benchmark_cache_episodes,
         )
+        if replay_output_path is not None:
+            _append_unique_replay_episodes(
+                replay_output_path,
+                episodes,
+                existing_keys=replay_keys,
+            )
         wins = sum(1 for episode in episodes if episode.winner == 0)
         losses = sum(1 for episode in episodes if episode.winner == 1)
         draws = sum(1 for episode in episodes if episode.winner not in {0, 1})
@@ -2287,27 +2263,6 @@ def _update_p2sro_payoff_matrix(
             else None
         )
         flush_threshold = _benchmark_eval_flush_threshold(len(jobs))
-        def payoff_progress_callback(
-            done: int,
-            total: int,
-            result: _EpisodeJobResult,
-            *,
-            opponent_policy_id: str = opponent_entry.policy_id,
-        ) -> None:
-            _append_replay_episode_if_useful(
-                replay_output_path,
-                result.episode,
-                existing_keys=replay_keys,
-            )
-            if enable_status_print:
-                print_episode_progress(
-                    label=f"p2sro-payoff-{candidate_policy_id}",
-                    round_index=round_index or 0,
-                    completed=done,
-                    total=total,
-                    episode=result.episode,
-                    extra=f"frozen:{opponent_policy_id}",
-                )
         episodes = _execute_episode_jobs(
             config=env_config,
             jobs=jobs,
@@ -2315,14 +2270,27 @@ def _update_p2sro_payoff_matrix(
             workers=_benchmark_eval_workers(workers),
             output_path=payoff_output_path,
             progress_callback=(
-                payoff_progress_callback
-                if (enable_status_print or replay_output_path is not None)
-                else None
+                (lambda done, total, result, opponent_policy_id=opponent_entry.policy_id:
+                    print_episode_progress(
+                        label=f"p2sro-payoff-{candidate_policy_id}",
+                        round_index=round_index or 0,
+                        completed=done,
+                        total=total,
+                        episode=result.episode,
+                        extra=f"frozen:{opponent_policy_id}",
+                    ))
+                if enable_status_print else None
             ),
             flush_threshold=flush_threshold,
             load_persisted_episodes=_load_benchmark_cache_episodes,
             persist_episodes=_append_benchmark_cache_episodes,
         )
+        if replay_output_path is not None:
+            _append_unique_replay_episodes(
+                replay_output_path,
+                episodes,
+                existing_keys=replay_keys,
+            )
         wins = sum(1 for episode in episodes if episode.winner == 0)
         losses = sum(1 for episode in episodes if episode.winner == 1)
         draws = sum(1 for episode in episodes if episode.winner not in {0, 1})

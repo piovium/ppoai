@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import tempfile
@@ -14,8 +15,11 @@ from gitcg_world_model.decks import SMALL_DECK_MATCHUPS, SMALL_DECK_POOL
 from gitcg_world_model.ppo_pipeline import (
     _append_benchmark_cache_episodes,
     _benchmark_eval_workers,
+    _candidate_evaluation_to_payoff_results,
     _EpisodeJob,
+    _evaluate_checkpoint_against_population,
     _LoopState,
+    _SlotCandidateEvaluation,
     _TaggedAgent,
     _execute_episode_jobs,
     _load_benchmark_cache_episodes,
@@ -27,8 +31,9 @@ from gitcg_world_model.ppo_pipeline import (
     _shortlist_candidate_epochs,
     run_ppo_managed_loop,
 )
-from gitcg_world_model.replay import append_episode_records
+from gitcg_world_model.replay import append_episode_records, load_episode_records
 from gitcg_world_model.schema import EnvConfig, EpisodeRecord, PlayerSnapshot, StateSnapshot
+from gitcg_world_model.testsupport import synthetic_episode_record
 
 
 _EMPTY_PLAYER = PlayerSnapshot(
@@ -192,6 +197,44 @@ class PpoPipelineTests(unittest.TestCase):
         self.assertEqual(safe_epochs, [])
         self.assertEqual(shortlist, [2])
         self.assertEqual(fallback_reason, "no_safe_epoch")
+
+    def test_candidate_evaluation_to_payoff_results_builds_payoff_records(self):
+        candidate = _SlotCandidateEvaluation(
+            epoch=6,
+            checkpoint_path="candidate.pt",
+            expected_payoff_vs_meta=0.25,
+            matchup_results=(
+                {
+                    "opponent_policy_id": "main_0001",
+                    "matchup": "sample_a__vs__sample_a",
+                    "episodes": 2,
+                    "wins": 2,
+                    "losses": 0,
+                    "draws": 0,
+                    "payoff": 1.0,
+                },
+                {
+                    "opponent_policy_id": "main_0001",
+                    "matchup": "sample_a__vs__sample_b",
+                    "episodes": 2,
+                    "wins": 1,
+                    "losses": 1,
+                    "draws": 0,
+                    "payoff": 0.0,
+                },
+            ),
+            per_policy_payoffs={"main_0001": 0.5},
+            meta_policy_probabilities={"main_0001": 1.0},
+        )
+
+        results = _candidate_evaluation_to_payoff_results(candidate)
+
+        self.assertEqual(set(results), {"main_0001"})
+        self.assertEqual(results["main_0001"].episodes, 4)
+        self.assertEqual(results["main_0001"].wins, 3)
+        self.assertEqual(results["main_0001"].losses, 1)
+        self.assertEqual(results["main_0001"].payoff, 0.5)
+        self.assertEqual(len(results["main_0001"].matchup_results), 2)
 
     def test_resolve_initial_checkpoint_prefers_deployment_sibling(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -358,11 +401,70 @@ class PpoPipelineTests(unittest.TestCase):
     def test_benchmark_eval_workers_uses_safe_default_cap_and_env_override(self):
         with patch.dict(os.environ, {}, clear=False):
             self.assertEqual(_benchmark_eval_workers(1), 1)
-            self.assertEqual(_benchmark_eval_workers(8), 2)
+            self.assertEqual(_benchmark_eval_workers(8), 1)
         with patch.dict(os.environ, {"P2SRO_BENCHMARK_WORKERS": "4"}, clear=False):
             self.assertEqual(_benchmark_eval_workers(8), 4)
         with patch.dict(os.environ, {"P2SRO_BENCHMARK_WORKERS": "bad"}, clear=False):
-            self.assertEqual(_benchmark_eval_workers(8), 2)
+            self.assertEqual(_benchmark_eval_workers(8), 1)
+
+    def test_evaluate_checkpoint_against_population_streams_learning_replay(self):
+        config = EnvConfig(deck_pool=SMALL_DECK_POOL)
+        opponent = SimpleNamespace(policy_id="main_0001", checkpoint_path="opponent.pt")
+        meta_strategy = SimpleNamespace(probabilities={"main_0001": 1.0})
+        full_episode = replace(
+            synthetic_episode_record(),
+            matchup=SMALL_DECK_MATCHUPS[0].key,
+            seed=11,
+            metadata={"opponent_policy_id": "main_0001"},
+        )
+
+        def fake_execute_episode_jobs(**kwargs):
+            result = SimpleNamespace(job=kwargs["jobs"][0], episode=full_episode)
+            if kwargs["progress_callback"] is not None:
+                kwargs["progress_callback"](1, 1, result)
+            return (full_episode,)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            replay_path = Path(temp_dir) / "selection_replay.jsonl"
+            with (
+                patch(
+                    "gitcg_world_model.ppo_pipeline.build_checkpoint_agent_factory",
+                    return_value=(lambda _seed: _TaggedAgent(object(), trainable=False, tag="candidate")),
+                ),
+                patch(
+                    "gitcg_world_model.ppo_pipeline.build_opponent_factory",
+                    return_value=(lambda _seed: _TaggedAgent(object(), trainable=False, tag="opponent")),
+                ),
+                patch(
+                    "gitcg_world_model.ppo_pipeline._execute_episode_jobs",
+                    side_effect=fake_execute_episode_jobs,
+                ),
+            ):
+                expected_payoff, per_policy_payoffs, matchup_payloads = _evaluate_checkpoint_against_population(
+                    checkpoint_path=Path("candidate.pt"),
+                    frozen_population=(opponent,),
+                    meta_strategy=meta_strategy,
+                    env_config=config,
+                    matchups=(SMALL_DECK_MATCHUPS[0],),
+                    device="cpu",
+                    max_decisions=8,
+                    workers=1,
+                    cache={},
+                    inference_server=None,
+                    episodes_per_matchup=1,
+                    seed_start=11,
+                    output_dir=Path(temp_dir) / "selection_cache",
+                    replay_output_path=replay_path,
+                    progress_callback=None,
+                )
+
+            replay_episodes = load_episode_records(replay_path)
+
+        self.assertEqual(expected_payoff, 1.0)
+        self.assertEqual(per_policy_payoffs, {"main_0001": 1.0})
+        self.assertEqual(len(matchup_payloads), 1)
+        self.assertEqual(len(replay_episodes), 1)
+        self.assertGreater(len(replay_episodes[0].steps), 0)
 
     def test_recommended_rollout_workers_caps_large_models(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -412,7 +514,11 @@ class PpoPipelineTests(unittest.TestCase):
             self.assertTrue((workspace / "round_0001" / "self_play.jsonl").exists())
             self.assertTrue((workspace / "round_0001" / "br_self_play.jsonl").exists())
             self.assertTrue((workspace / "round_0001" / "train" / "selection_summary.json").exists())
+            self.assertTrue((workspace / "round_0001" / "train" / "selection_replay.jsonl").exists())
             self.assertTrue((workspace / "round_0001" / "br_train" / "selection_summary.json").exists())
+            self.assertTrue((workspace / "round_0001" / "br_train" / "selection_replay.jsonl").exists())
+            main_selection_replay = load_episode_records(workspace / "round_0001" / "train" / "selection_replay.jsonl")
+            br_selection_replay = load_episode_records(workspace / "round_0001" / "br_train" / "selection_replay.jsonl")
 
             state_payload = json.loads((workspace / "event_loop_state.json").read_text(encoding="utf-8"))
             analysis_payload = json.loads((workspace / "round_0001" / "analysis.json").read_text(encoding="utf-8"))
@@ -431,6 +537,12 @@ class PpoPipelineTests(unittest.TestCase):
             self.assertIn("active_br_slot", analysis_payload)
             self.assertEqual(main_selection["selection_method"], "expected_payoff_vs_meta")
             self.assertEqual(br_selection["selection_method"], "expected_payoff_vs_meta")
+            self.assertIn("selection_replay_path", main_selection)
+            self.assertIn("selection_replay_path", br_selection)
+            self.assertTrue(main_selection_replay)
+            self.assertTrue(br_selection_replay)
+            self.assertTrue(all(len(episode.steps) > 0 for episode in main_selection_replay))
+            self.assertTrue(all(len(episode.steps) > 0 for episode in br_selection_replay))
             self.assertIn("p2sro_state_path", state_payload)
             self.assertIn("meta_strategy_path", state_payload)
             self.assertTrue(p2sro_payload["frozen_population"])
