@@ -303,16 +303,10 @@ def build_checkpoint_agent_factory(
     env_config: EnvConfig | None = None,
 ) -> Callable[[int], _TaggedAgent]:
     resolved = Path(checkpoint_path)
+    model, encoder = _cached_checkpoint_bundle(resolved, device=device, cache=cache)
     model_key = str(resolved.resolve())
     if inference_server is not None:
-        model, encoder = _cached_checkpoint_bundle(
-            resolved,
-            device=device,
-            cache=cache,
-            inference_server=inference_server,
-        )
-    else:
-        model, encoder = _cached_checkpoint_bundle(resolved, device=device, cache=cache)
+        inference_server.register_model(model_key, model)
 
     def factory(seed: int) -> _TaggedAgent:
         del seed
@@ -427,65 +421,17 @@ def _cached_checkpoint_bundle(
     *,
     device: str,
     cache: dict[tuple[str, str], tuple[Any, Any]] | None = None,
-    inference_server: GpuInferenceServer | None = None,
 ) -> tuple[Any, Any]:
-    resolved_path = str(checkpoint_path.resolve())
-    key = (resolved_path, device)
+    key = (str(checkpoint_path.resolve()), device)
     if cache is not None and key in cache:
         return cache[key]
-    if inference_server is not None:
-        existing_model = inference_server.get_registered_model(resolved_path)
-        if existing_model is not None:
-            try:
-                _, encoder, _ = load_ppo_deployment_checkpoint(checkpoint_path, device="cpu")
-            except Exception:
-                _, encoder, _, _ = load_ppo_training_checkpoint(checkpoint_path, device="cpu")
-            model = existing_model
-        else:
-            try:
-                model, encoder, _ = load_ppo_deployment_checkpoint(checkpoint_path, device=device)
-            except Exception:
-                model, encoder, _, _ = load_ppo_training_checkpoint(checkpoint_path, device=device)
-            model = inference_server.register_model(resolved_path, model)
-    else:
-        try:
-            model, encoder, _ = load_ppo_deployment_checkpoint(checkpoint_path, device=device)
-        except Exception:
-            model, encoder, _, _ = load_ppo_training_checkpoint(checkpoint_path, device=device)
+    try:
+        model, encoder, _ = load_ppo_deployment_checkpoint(checkpoint_path, device=device)
+    except Exception:
+        model, encoder, _, _ = load_ppo_training_checkpoint(checkpoint_path, device=device)
     if cache is not None:
         cache[key] = (model, encoder)
     return model, encoder
-
-
-def _retain_checkpoint_bundle_cache(
-    cache: dict[tuple[str, str], tuple[Any, Any]] | None,
-    *,
-    keep_paths: set[str],
-) -> None:
-    if cache is None:
-        return
-    stale_keys = [key for key in cache if key[0] not in keep_paths]
-    for key in stale_keys:
-        cache.pop(key, None)
-    if stale_keys:
-        gc.collect()
-
-
-def _retain_inference_models(
-    inference_server: GpuInferenceServer | None,
-    cache: dict[tuple[str, str], tuple[Any, Any]] | None,
-    *,
-    keep_paths: Sequence[str | Path | None],
-) -> None:
-    if inference_server is None:
-        return
-    keep_keys = {
-        str(Path(path).resolve())
-        for path in keep_paths
-        if path is not None
-    }
-    inference_server.retain_models(keep_keys)
-    _retain_checkpoint_bundle_cache(cache, keep_paths=keep_keys)
 
 
 def _opponent_tag(kind: str, source: str) -> str:
@@ -1661,10 +1607,9 @@ def collect_p2sro_training_episodes(
     output_path: str | Path,
     workers: int = 1,
     inference_server: GpuInferenceServer | None = None,
-    cache: dict[tuple[str, str], tuple[Any, Any]] | None = None,
     progress_callback: SelfPlayProgressCallback | None = None,
 ) -> tuple[EpisodeRecord, ...]:
-    bundle_cache = cache if cache is not None else {}
+    cache: dict[tuple[str, str], tuple[Any, Any]] = {}
     total = len(matchups) * episodes_per_matchup
     jobs: list[_EpisodeJob] = []
     frozen_entries = tuple(frozen_population)
@@ -1692,7 +1637,7 @@ def collect_p2sro_training_episodes(
                         opponent_tag="meta_population",
                         opponent_entity_key=opponent_entry.policy_id,
                         opponent_deck_name=matchup.deck1,
-                        cache=bundle_cache,
+                        cache=cache,
                         inference_server=inference_server,
                         env_config=config,
                     ),
@@ -1705,7 +1650,7 @@ def collect_p2sro_training_episodes(
                         opponent_entity_key="active_slot",
                         opponent_deck_name=matchup.deck0,
                         observed_opponent_tag="active_population_slot",
-                        cache=bundle_cache,
+                        cache=cache,
                         inference_server=inference_server,
                         env_config=config,
                     ),
@@ -1878,7 +1823,6 @@ def _select_active_slot_checkpoint(
     meta_strategy: MetaStrategySnapshot,
     workers: int,
     inference_server: GpuInferenceServer | None,
-    cache: dict[tuple[str, str], tuple[Any, Any]] | None,
     enable_status_print: bool,
     round_index: int | None = None,
 ) -> tuple[Path, int, Path, _SlotCandidateEvaluation]:
@@ -1890,7 +1834,7 @@ def _select_active_slot_checkpoint(
     )
     if not shortlist_epochs:
         raise RuntimeError("no checkpoint candidates available for active slot selection")
-    bundle_cache = cache if cache is not None else {}
+    cache: dict[tuple[str, str], tuple[Any, Any]] = {}
     candidates: list[_SlotCandidateEvaluation] = []
     for epoch in shortlist_epochs:
         checkpoint_path = _candidate_checkpoint_path(train_dir, epoch)
@@ -1907,7 +1851,7 @@ def _select_active_slot_checkpoint(
             device=device,
             max_decisions=max_decisions,
             workers=workers,
-            cache=bundle_cache,
+            cache=cache,
             inference_server=inference_server,
             episodes_per_matchup=benchmark_config.episodes_per_matchup,
             seed_start=seed_start + epoch * 1_000,
@@ -1985,14 +1929,13 @@ def _update_p2sro_payoff_matrix(
     max_decisions: int | None,
     workers: int,
     inference_server: GpuInferenceServer | None,
-    cache: dict[tuple[str, str], tuple[Any, Any]] | None,
     episodes_per_matchup: int,
     seed_start: int,
     cache_dir: Path | None = None,
     round_index: int | None = None,
     enable_status_print: bool = False,
 ) -> dict[str, float]:
-    bundle_cache = cache if cache is not None else {}
+    cache: dict[tuple[str, str], tuple[Any, Any]] = {}
     per_policy_payoffs: dict[str, float] = {}
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2023,7 +1966,7 @@ def _update_p2sro_payoff_matrix(
                             opponent_tag="frozen_population",
                             opponent_entity_key=opponent_entry.policy_id,
                             opponent_deck_name=matchup.deck1,
-                            cache=bundle_cache,
+                            cache=cache,
                             inference_server=inference_server,
                             env_config=env_config,
                         ),
@@ -2036,7 +1979,7 @@ def _update_p2sro_payoff_matrix(
                             opponent_entity_key=candidate_policy_id,
                             opponent_deck_name=matchup.deck0,
                             observed_opponent_tag="active_population_slot",
-                            cache=bundle_cache,
+                            cache=cache,
                             inference_server=inference_server,
                             env_config=env_config,
                         ),
@@ -2385,19 +2328,12 @@ def run_ppo_managed_loop(
         if resolved_workers > 1
         else None
     )
-    shared_checkpoint_cache: dict[tuple[str, str], tuple[Any, Any]] | None = (
-        {}
-        if inference_server is not None
-        else None
-    )
     for round_index in range(start_round, rounds + 1):
         round_resume_phase = (
             resume_cursor.phase
             if resume_cursor is not None and round_index == resume_cursor.round_index
             else None
         )
-        main_self_play_draw_rate = 0.0
-        main_self_play_late_round_rate = 0.0
         round_dir = workspace_path / f"round_{round_index:04d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         bootstrap_path = round_dir / "bootstrap.jsonl"
@@ -2566,7 +2502,6 @@ def run_ppo_managed_loop(
                 output_path=self_play_path,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 progress_callback=_self_play_phase_callback(
                     phase="active_main_slot",
                     round_index=round_index,
@@ -2577,8 +2512,6 @@ def run_ppo_managed_loop(
                 ),
             )
             self_play_analysis = analyze_episode_records(self_play_episodes, player=0)
-            main_self_play_draw_rate = float(self_play_analysis.draw_rate)
-            main_self_play_late_round_rate = float(self_play_analysis.late_round_rate)
             write_episode_analysis(
                 self_play_analysis_path,
                 phase="self_play",
@@ -2637,7 +2570,6 @@ def run_ppo_managed_loop(
                 meta_strategy=meta_snapshot,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
                 round_index=round_index,
             )
@@ -2648,14 +2580,6 @@ def run_ppo_managed_loop(
                 expected_payoff_vs_meta=selected_main_candidate.expected_payoff_vs_meta,
             )
             manager.save()
-            _retain_inference_models(
-                inference_server,
-                shared_checkpoint_cache,
-                keep_paths=[
-                    selected_main_checkpoint,
-                    *(entry.checkpoint_path for entry in manager.frozen_entries()),
-                ],
-            )
             tracker.complete_phase(
                 "active_main_slot",
                 total_units=main_phase_total,
@@ -2676,8 +2600,6 @@ def run_ppo_managed_loop(
             main_train_artifacts = partial_main_train_artifacts
             self_play_episodes = load_episode_records(self_play_path)
             self_play_analysis = analyze_episode_records(self_play_episodes, player=0)
-            main_self_play_draw_rate = float(self_play_analysis.draw_rate)
-            main_self_play_late_round_rate = float(self_play_analysis.late_round_rate)
             replay_episodes = _load_recent_p2sro_replay_episodes(
                 workspace_path,
                 current_round=round_index,
@@ -2696,7 +2618,6 @@ def run_ppo_managed_loop(
                 meta_strategy=meta_snapshot,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
                 round_index=round_index,
             )
@@ -2713,8 +2634,6 @@ def run_ppo_managed_loop(
                 raise RuntimeError(f"missing main train artifacts for resume: {train_dir}")
             self_play_episodes = load_episode_records(self_play_path)
             self_play_analysis = analyze_episode_records(self_play_episodes, player=0)
-            main_self_play_draw_rate = float(self_play_analysis.draw_rate)
-            main_self_play_late_round_rate = float(self_play_analysis.late_round_rate)
             replay_episodes = _load_recent_p2sro_replay_episodes(
                 workspace_path,
                 current_round=round_index,
@@ -2731,17 +2650,6 @@ def run_ppo_managed_loop(
                 manager.save()
             else:
                 main_slot_state = manager.active_main_slot
-        _retain_inference_models(
-            inference_server,
-            shared_checkpoint_cache,
-            keep_paths=[
-                selected_main_checkpoint,
-                *(entry.checkpoint_path for entry in manager.frozen_entries()),
-            ],
-        )
-        self_play_episodes = ()
-        replay_episodes = ()
-        gc.collect()
         br_slot_state = manager.set_active_slot_seed(
             slot_name="active_br_slot",
             lineage="best_response",
@@ -2785,7 +2693,6 @@ def run_ppo_managed_loop(
                 output_path=br_self_play_path,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 progress_callback=_self_play_phase_callback(
                     phase="active_br_slot",
                     round_index=round_index,
@@ -2802,20 +2709,11 @@ def run_ppo_managed_loop(
                 round_index=round_index,
                 analytics=br_self_play_analysis,
             )
-            main_phase_episodes = load_episode_records(self_play_path)
-            recent_replay_episodes = _load_recent_p2sro_replay_episodes(
-                workspace_path,
-                current_round=round_index,
-                replay_round_window=3,
-            )
             br_replay_episodes = _compose_replay_buffer(
-                main_phase_episodes,
-                recent_replay_episodes,
+                self_play_episodes,
+                replay_episodes,
                 label="br_train_replay",
             )
-            main_phase_episodes = ()
-            recent_replay_episodes = ()
-            gc.collect()
             br_train_artifacts = train_ppo_from_episodes(
                 episodes=br_self_play_episodes,
                 replay_episodes=br_replay_episodes,
@@ -2863,7 +2761,6 @@ def run_ppo_managed_loop(
                 meta_strategy=meta_snapshot,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
                 round_index=round_index,
             )
@@ -2874,15 +2771,6 @@ def run_ppo_managed_loop(
                 expected_payoff_vs_meta=selected_br_candidate.expected_payoff_vs_meta,
             )
             manager.save()
-            _retain_inference_models(
-                inference_server,
-                shared_checkpoint_cache,
-                keep_paths=[
-                    selected_main_checkpoint,
-                    selected_br_checkpoint,
-                    *(entry.checkpoint_path for entry in manager.frozen_entries()),
-                ],
-            )
             tracker.complete_phase(
                 "active_br_slot",
                 total_units=br_phase_total,
@@ -2903,15 +2791,7 @@ def run_ppo_managed_loop(
             br_train_artifacts = partial_br_train_artifacts
             br_self_play_episodes = load_episode_records(br_self_play_path)
             br_self_play_analysis = analyze_episode_records(br_self_play_episodes, player=0)
-            br_replay_episodes = _compose_replay_buffer(
-                load_episode_records(self_play_path),
-                _load_recent_p2sro_replay_episodes(
-                    workspace_path,
-                    current_round=round_index,
-                    replay_round_window=3,
-                ),
-                label="br_train_replay_resume",
-            )
+            br_replay_episodes = tuple(replay_episodes) + tuple(self_play_episodes)
             selected_br_checkpoint, selected_br_epoch, br_selection_path, selected_br_candidate = _select_active_slot_checkpoint(
                 train_dir=br_train_dir,
                 train_artifacts=br_train_artifacts,
@@ -2925,7 +2805,6 @@ def run_ppo_managed_loop(
                 meta_strategy=meta_snapshot,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
                 round_index=round_index,
             )
@@ -2973,7 +2852,6 @@ def run_ppo_managed_loop(
                 max_decisions=max_decisions,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
                 seed_start=seed_start + round_index * 50_000,
                 cache_dir=round_dir / "payoff_cache",
@@ -2996,7 +2874,6 @@ def run_ppo_managed_loop(
                 max_decisions=max_decisions,
                 workers=resolved_workers,
                 inference_server=inference_server,
-                cache=shared_checkpoint_cache,
                 episodes_per_matchup=resolved_benchmark_config.episodes_per_matchup,
                 seed_start=seed_start + round_index * 60_000,
                 cache_dir=round_dir / "payoff_cache",
@@ -3006,14 +2883,6 @@ def run_ppo_managed_loop(
             promoted_entries.append(promoted_br)
         meta_snapshot = manager.recompute_meta_strategy()
         manager.save()
-        _retain_inference_models(
-            inference_server,
-            shared_checkpoint_cache,
-            keep_paths=[
-                selected_main_checkpoint,
-                *(entry.checkpoint_path for entry in manager.frozen_entries()),
-            ],
-        )
         atomic_write_json(
             deployment_manifest_path,
             {
@@ -3049,8 +2918,8 @@ def run_ppo_managed_loop(
             "active_br_expected_payoff_vs_meta": float(selected_br_candidate.expected_payoff_vs_meta),
             "promoted_policy_ids": [entry.policy_id for entry in promoted_entries],
             "baseline_eval_only": True,
-            "draw_rate": float(main_self_play_draw_rate),
-            "late_round_rate": float(main_self_play_late_round_rate),
+            "draw_rate": float(self_play_analysis.draw_rate),
+            "late_round_rate": float(self_play_analysis.late_round_rate),
         }
         atomic_write_json(analysis_path, analysis_payload)
         current_training_checkpoint = Path(selected_main_checkpoint)
@@ -3087,8 +2956,8 @@ def run_ppo_managed_loop(
                 "active_main_slot_lineage": main_slot_state.lineage,
                 "active_br_slot_lineage": br_slot_state.lineage,
                 "promoted_policy_ids": [entry.policy_id for entry in promoted_entries],
-                "draw_rate": float(main_self_play_draw_rate),
-                "late_round_rate": float(main_self_play_late_round_rate),
+                "draw_rate": float(self_play_analysis.draw_rate),
+                "late_round_rate": float(self_play_analysis.late_round_rate),
             },
         )
         bootstrap_episodes = ()

@@ -3,6 +3,14 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSCommandPath))
 $workspace = 'D:\WorldModelTemp\ppo_oracle_search_psro_live_stable_actions_rerollfix'
 $manifestPath = Join-Path $workspace 'run_manifest.json'
+$statePath = Join-Path $workspace 'event_loop_state.json'
+$statusPath = Join-Path $workspace 'event_loop_status.json'
+$resultPath = Join-Path $workspace 'event_loop_result.json'
+$targetRounds = 100
+$restartDelaySeconds = 10
+$maxConsecutiveNoProgressAttempts = 5
+$sessionTs = Get-Date -Format 'yyyyMMdd_HHmmss'
+$trace = Join-Path $workspace ('launcher_resume_' + $sessionTs + '.log')
 
 function Test-RunningManifest {
     param(
@@ -28,20 +36,128 @@ function Test-RunningManifest {
     return [bool](Get-Process -Id ([int]$manifest.pid) -ErrorAction SilentlyContinue)
 }
 
-New-Item -ItemType Directory -Force -Path $workspace | Out-Null
-
-if (Test-RunningManifest -TargetManifestPath $manifestPath -TargetWorkspace $workspace) {
-    exit 0
-}
-
-$ts = Get-Date -Format 'yyyyMMdd_HHmmss'
-$stdout = Join-Path $workspace ('stdout_resume_' + $ts + '.log')
-$stderr = Join-Path $workspace ('stderr_resume_' + $ts + '.log')
-$trace = Join-Path $workspace ('launcher_resume_' + $ts + '.log')
-
 function Write-TraceLine {
     param([string]$Message)
     Add-Content -Path $trace -Value ('[' + (Get-Date -Format o) + '] ' + $Message) -Encoding utf8
+}
+
+function Get-CompletionState {
+    param(
+        [string]$TargetStatePath,
+        [string]$TargetResultPath,
+        [int]$ExpectedRounds
+    )
+
+    $completedRound = 0
+    $currentRound = $null
+    $currentPhase = $null
+
+    if (Test-Path $TargetStatePath) {
+        try {
+            $state = Get-Content $TargetStatePath -Raw | ConvertFrom-Json
+            if ($null -ne $state.completed_round) {
+                $completedRound = [int]$state.completed_round
+            }
+            elseif ($null -ne $state.round) {
+                $completedRound = [int]$state.round
+            }
+            $currentRound = $state.current_round
+            $currentPhase = $state.current_phase
+        }
+        catch {
+        }
+    }
+
+    $hasResult = Test-Path $TargetResultPath
+    $noActiveRound = $null -eq $currentRound -or [string]::IsNullOrWhiteSpace([string]$currentRound)
+    $noActivePhase = [string]::IsNullOrWhiteSpace([string]$currentPhase)
+    $isComplete = $hasResult -and $completedRound -ge $ExpectedRounds -and $noActiveRound -and $noActivePhase
+
+    return [pscustomobject][ordered]@{
+        completed_round = $completedRound
+        current_round = $currentRound
+        current_phase = $currentPhase
+        has_result = $hasResult
+        is_complete = $isComplete
+    }
+}
+
+function Get-ProgressSnapshot {
+    param(
+        [string]$TargetStatePath,
+        [string]$TargetStatusPath
+    )
+
+    $completedRound = 0
+    $currentRound = $null
+    $currentPhase = $null
+    $statusPhase = $null
+    $statusCompletedUnits = 0
+    $statusTotalUnits = 0
+    $statusUpdatedAt = $null
+    $currentTask = $null
+
+    if (Test-Path $TargetStatePath) {
+        try {
+            $state = Get-Content $TargetStatePath -Raw | ConvertFrom-Json
+            if ($null -ne $state.completed_round) {
+                $completedRound = [int]$state.completed_round
+            }
+            elseif ($null -ne $state.round) {
+                $completedRound = [int]$state.round
+            }
+            $currentRound = $state.current_round
+            $currentPhase = $state.current_phase
+        }
+        catch {
+        }
+    }
+
+    if (Test-Path $TargetStatusPath) {
+        try {
+            $status = Get-Content $TargetStatusPath -Raw | ConvertFrom-Json
+            $statusPhase = $status.phase
+            if ($null -ne $status.completed_units) {
+                $statusCompletedUnits = [int]$status.completed_units
+            }
+            if ($null -ne $status.total_units) {
+                $statusTotalUnits = [int]$status.total_units
+            }
+            $statusUpdatedAt = $status.updated_at
+            $currentTask = $status.current_task
+        }
+        catch {
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        completed_round = $completedRound
+        current_round = $currentRound
+        current_phase = $currentPhase
+        status_phase = $statusPhase
+        status_completed_units = $statusCompletedUnits
+        status_total_units = $statusTotalUnits
+        status_updated_at = $statusUpdatedAt
+        current_task = $currentTask
+    }
+}
+
+function Get-SnapshotSignature {
+    param([object]$Snapshot)
+    return ($Snapshot | ConvertTo-Json -Compress -Depth 4)
+}
+
+New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+
+$completionState = Get-CompletionState -TargetStatePath $statePath -TargetResultPath $resultPath -ExpectedRounds $targetRounds
+if ($completionState.is_complete) {
+    Write-TraceLine ('already_complete=' + (Get-SnapshotSignature -Snapshot $completionState))
+    exit 0
+}
+
+if (Test-RunningManifest -TargetManifestPath $manifestPath -TargetWorkspace $workspace) {
+    Write-TraceLine ('already_running_manifest=' + $manifestPath)
+    exit 0
 }
 
 $pythonCommand = Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1
@@ -62,7 +178,7 @@ $args = @(
     '-u',
     $scriptPath,
     '--workspace', $workspace,
-    '--rounds', '100',
+    '--rounds', [string]$targetRounds,
     '--bootstrap-episodes-per-matchup', '8',
     '--self-play-episodes-per-matchup', '8',
     '--max-decisions', '512',
@@ -97,11 +213,69 @@ $args = @(
 Write-TraceLine ('repo_root=' + $repoRoot)
 Write-TraceLine ('workspace=' + $workspace)
 Write-TraceLine ('python=' + $pythonExe)
-Write-TraceLine ('stdout=' + $stdout)
-Write-TraceLine ('stderr=' + $stderr)
 Write-TraceLine ('command=' + $pythonExe + ' ' + ($args -join ' '))
+Write-TraceLine ('restart_delay_seconds=' + $restartDelaySeconds)
+Write-TraceLine ('max_consecutive_no_progress_attempts=' + $maxConsecutiveNoProgressAttempts)
 
-& $pythonExe @args 1>> $stdout 2>> $stderr
-$exitCode = $LASTEXITCODE
-Write-TraceLine ('exit_code=' + $exitCode)
-exit $exitCode
+$attempt = 0
+$consecutiveNoProgressAttempts = 0
+
+while ($true) {
+    $completionState = Get-CompletionState -TargetStatePath $statePath -TargetResultPath $resultPath -ExpectedRounds $targetRounds
+    if ($completionState.is_complete) {
+        Write-TraceLine ('completed=' + (Get-SnapshotSignature -Snapshot $completionState))
+        exit 0
+    }
+
+    if (Test-RunningManifest -TargetManifestPath $manifestPath -TargetWorkspace $workspace) {
+        Write-TraceLine ('detected_external_running_process=' + $manifestPath)
+        exit 0
+    }
+
+    $attempt += 1
+    $attemptTs = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $stdout = Join-Path $workspace ('stdout_resume_' + $attemptTs + '.log')
+    $stderr = Join-Path $workspace ('stderr_resume_' + $attemptTs + '.log')
+    $beforeSnapshot = Get-ProgressSnapshot -TargetStatePath $statePath -TargetStatusPath $statusPath
+    $beforeSignature = Get-SnapshotSignature -Snapshot $beforeSnapshot
+
+    Write-TraceLine ('attempt=' + $attempt + ' starting')
+    Write-TraceLine ('attempt=' + $attempt + ' stdout=' + $stdout)
+    Write-TraceLine ('attempt=' + $attempt + ' stderr=' + $stderr)
+    Write-TraceLine ('attempt=' + $attempt + ' progress_before=' + $beforeSignature)
+
+    & $pythonExe @args 1>> $stdout 2>> $stderr
+    $exitCode = $LASTEXITCODE
+
+    $afterSnapshot = Get-ProgressSnapshot -TargetStatePath $statePath -TargetStatusPath $statusPath
+    $afterSignature = Get-SnapshotSignature -Snapshot $afterSnapshot
+    $progressChanged = $beforeSignature -ne $afterSignature
+    if ($progressChanged) {
+        $consecutiveNoProgressAttempts = 0
+    }
+    else {
+        $consecutiveNoProgressAttempts += 1
+    }
+
+    Write-TraceLine ('attempt=' + $attempt + ' exit_code=' + $exitCode)
+    Write-TraceLine ('attempt=' + $attempt + ' progress_after=' + $afterSignature)
+    Write-TraceLine ('attempt=' + $attempt + ' progress_changed=' + $progressChanged)
+    Write-TraceLine ('attempt=' + $attempt + ' consecutive_no_progress_attempts=' + $consecutiveNoProgressAttempts)
+
+    $completionState = Get-CompletionState -TargetStatePath $statePath -TargetResultPath $resultPath -ExpectedRounds $targetRounds
+    if ($completionState.is_complete) {
+        Write-TraceLine ('completed=' + (Get-SnapshotSignature -Snapshot $completionState))
+        exit 0
+    }
+
+    if ($consecutiveNoProgressAttempts -ge $maxConsecutiveNoProgressAttempts) {
+        Write-TraceLine ('stopping_after_no_progress=' + (Get-SnapshotSignature -Snapshot $afterSnapshot))
+        if ($exitCode -eq 0) {
+            exit 1
+        }
+        exit $exitCode
+    }
+
+    Write-TraceLine ('attempt=' + $attempt + ' sleeping_seconds=' + $restartDelaySeconds)
+    Start-Sleep -Seconds $restartDelaySeconds
+}

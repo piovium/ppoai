@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import queue
 import threading
 import time
@@ -68,35 +67,13 @@ class GpuInferenceServer:
         )
         self._worker.start()
 
-    def register_model(self, model_key: str, model: PpoTransformerPolicy) -> PpoTransformerPolicy:
+    def register_model(self, model_key: str, model: PpoTransformerPolicy) -> None:
         with self._lock:
-            existing = self._models.get(model_key)
-            if existing is not None:
-                return existing
+            if model_key in self._models:
+                return
             model.to(self.device)
             model.eval()
             self._models[model_key] = model
-            return model
-
-    def get_registered_model(self, model_key: str) -> PpoTransformerPolicy | None:
-        with self._lock:
-            return self._models.get(model_key)
-
-    def retain_models(self, model_keys: set[str]) -> None:
-        stale_models: list[PpoTransformerPolicy] = []
-        with self._lock:
-            stale_keys = [key for key in self._models if key not in model_keys]
-            for key in stale_keys:
-                stale_models.append(self._models.pop(key))
-        for model in stale_models:
-            try:
-                model.to("cpu")
-            except RuntimeError:
-                pass
-        if stale_models:
-            gc.collect()
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     def infer(
         self,
