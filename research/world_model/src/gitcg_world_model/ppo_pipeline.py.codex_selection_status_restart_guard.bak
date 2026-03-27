@@ -1993,7 +1993,6 @@ def _select_active_slot_checkpoint(
     inference_server: GpuInferenceServer | None,
     cache: dict[tuple[str, str], tuple[Any, Any]] | None,
     enable_status_print: bool,
-    selection_progress_callback: Callable[[int, int, int, int, int, EpisodeRecord, str], None] | None = None,
     round_index: int | None = None,
 ) -> tuple[Path, int, Path, _SlotCandidateEvaluation]:
     summary_payload = _load_training_summary_payload(train_artifacts.summary_path)
@@ -2007,41 +2006,12 @@ def _select_active_slot_checkpoint(
     bundle_cache = cache if cache is not None else {}
     candidates: list[_SlotCandidateEvaluation] = []
     selection_replay_path = _selection_replay_path(train_dir)
-    candidate_count = len(shortlist_epochs)
-    for candidate_index, epoch in enumerate(shortlist_epochs, start=1):
+    for epoch in shortlist_epochs:
         checkpoint_path = _candidate_checkpoint_path(train_dir, epoch)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"candidate checkpoint missing: {checkpoint_path}")
         selection_cache_dir = train_dir / "selection_cache" / f"epoch_{epoch:03d}"
         selection_cache_dir.mkdir(parents=True, exist_ok=True)
-        def selection_episode_callback(
-            done: int,
-            total: int,
-            episode: EpisodeRecord,
-            opponent_policy_id: str,
-            *,
-            eval_epoch: int = epoch,
-            eval_candidate_index: int = candidate_index,
-        ) -> None:
-            if selection_progress_callback is not None:
-                selection_progress_callback(
-                    eval_candidate_index,
-                    candidate_count,
-                    eval_epoch,
-                    done,
-                    total,
-                    episode,
-                    opponent_policy_id,
-                )
-            if enable_status_print and selection_progress_callback is None:
-                print_episode_progress(
-                    label=f"p2sro-selection-e{eval_epoch:03d}",
-                    round_index=round_index or 0,
-                    completed=done,
-                    total=total,
-                    episode=episode,
-                    extra=f"frozen:{opponent_policy_id}",
-                )
         expected_payoff, per_policy_payoffs, matchup_payloads = _evaluate_checkpoint_against_population(
             checkpoint_path=checkpoint_path,
             frozen_population=frozen_population,
@@ -2058,9 +2028,16 @@ def _select_active_slot_checkpoint(
             output_dir=selection_cache_dir,
             replay_output_path=selection_replay_path,
             progress_callback=(
-                selection_episode_callback
-                if (selection_progress_callback is not None or enable_status_print)
-                else None
+                (lambda done, total, episode, opponent_policy_id, eval_epoch=epoch:
+                    print_episode_progress(
+                        label=f"p2sro-selection-e{eval_epoch:03d}",
+                        round_index=round_index or 0,
+                        completed=done,
+                        total=total,
+                        episode=episode,
+                        extra=f"frozen:{opponent_policy_id}",
+                    ))
+                if enable_status_print else None
             ),
         )
         candidate = _SlotCandidateEvaluation(
@@ -2637,61 +2614,6 @@ def run_ppo_managed_loop(
                 )
 
         return callback
-
-    def _selection_phase_callback(
-        *,
-        phase: str,
-        round_index: int,
-        phase_total_units: int,
-        phase_overall_units: int,
-        artifacts: dict[str, str],
-        label: str,
-    ) -> Callable[[int, int, int, int, int, EpisodeRecord, str], None]:
-        def callback(
-            candidate_index: int,
-            candidate_total: int,
-            eval_epoch: int,
-            done: int,
-            total: int,
-            episode: EpisodeRecord,
-            opponent_policy_id: str,
-        ) -> None:
-            tracker.update_phase(
-                phase,
-                completed_units=phase_total_units,
-                total_units=phase_total_units,
-                current_task=(
-                    f"round_{round_index:04d} selection "
-                    f"candidate={candidate_index}/{candidate_total} "
-                    f"epoch={eval_epoch} "
-                    f"{done}/{total} {episode.matchup}"
-                ),
-                overall_completed_units=phase_overall_units,
-                artifacts=artifacts,
-                details={
-                    "selection_candidate_index": candidate_index,
-                    "selection_candidate_total": candidate_total,
-                    "selection_epoch": eval_epoch,
-                    "selection_completed": done,
-                    "selection_total": total,
-                    "last_matchup": episode.matchup,
-                    "last_opponent": f"frozen:{opponent_policy_id}",
-                    "last_winner": episode.winner,
-                    "last_steps": episode_step_count(episode),
-                    "last_truncated": bool(episode.metadata.get("truncated")),
-                },
-            )
-            if enable_status_print:
-                print_episode_progress(
-                    label=label,
-                    round_index=round_index,
-                    completed=done,
-                    total=total,
-                    episode=episode,
-                    extra=f"candidate={candidate_index}/{candidate_total} epoch={eval_epoch} frozen:{opponent_policy_id}",
-                )
-
-        return callback
     state = _load_loop_state(state_path) if resume else _LoopState(
         working_checkpoint=None,
         completed_round=0,
@@ -3005,14 +2927,6 @@ def run_ppo_managed_loop(
                 inference_server=inference_server,
                 cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
-                selection_progress_callback=_selection_phase_callback(
-                    phase="active_main_slot",
-                    round_index=round_index,
-                    phase_total_units=main_phase_total,
-                    phase_overall_units=(round_index - 1) * 5 + 1,
-                    artifacts=main_phase_artifacts,
-                    label="active-main-selection",
-                ),
                 round_index=round_index,
             )
             main_slot_state = manager.update_active_slot_result(
@@ -3072,14 +2986,6 @@ def run_ppo_managed_loop(
                 inference_server=inference_server,
                 cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
-                selection_progress_callback=_selection_phase_callback(
-                    phase="active_main_slot",
-                    round_index=round_index,
-                    phase_total_units=main_phase_total,
-                    phase_overall_units=(round_index - 1) * 5 + 1,
-                    artifacts=main_phase_artifacts,
-                    label="active-main-selection",
-                ),
                 round_index=round_index,
             )
             main_slot_state = manager.update_active_slot_result(
@@ -3265,14 +3171,6 @@ def run_ppo_managed_loop(
                 inference_server=inference_server,
                 cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
-                selection_progress_callback=_selection_phase_callback(
-                    phase="active_br_slot",
-                    round_index=round_index,
-                    phase_total_units=br_phase_total,
-                    phase_overall_units=(round_index - 1) * 5 + 2,
-                    artifacts=br_phase_artifacts,
-                    label="active-br-selection",
-                ),
                 round_index=round_index,
             )
             br_slot_state = manager.update_active_slot_result(
@@ -3340,14 +3238,6 @@ def run_ppo_managed_loop(
                 inference_server=inference_server,
                 cache=shared_checkpoint_cache,
                 enable_status_print=enable_status_print,
-                selection_progress_callback=_selection_phase_callback(
-                    phase="active_br_slot",
-                    round_index=round_index,
-                    phase_total_units=br_phase_total,
-                    phase_overall_units=(round_index - 1) * 5 + 2,
-                    artifacts=br_phase_artifacts,
-                    label="active-br-selection",
-                ),
                 round_index=round_index,
             )
             br_slot_state = manager.update_active_slot_result(

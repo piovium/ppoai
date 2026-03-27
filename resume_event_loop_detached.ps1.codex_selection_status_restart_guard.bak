@@ -6,7 +6,7 @@ $manifestPath = Join-Path $workspace 'run_manifest.json'
 $statePath = Join-Path $workspace 'event_loop_state.json'
 $statusPath = Join-Path $workspace 'event_loop_status.json'
 $resultPath = Join-Path $workspace 'event_loop_result.json'
-$targetRounds = 1000000
+$targetRounds = 100
 $restartDelaySeconds = 10
 $maxConsecutiveNoProgressAttempts = 5
 $sessionTs = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -85,8 +85,7 @@ function Get-CompletionState {
 function Get-ProgressSnapshot {
     param(
         [string]$TargetStatePath,
-        [string]$TargetStatusPath,
-        [string]$TargetWorkspace
+        [string]$TargetStatusPath
     )
 
     $completedRound = 0
@@ -97,8 +96,6 @@ function Get-ProgressSnapshot {
     $statusTotalUnits = 0
     $statusUpdatedAt = $null
     $currentTask = $null
-    $workspaceLatestWriteAt = $null
-    $workspaceLatestWritePath = $null
 
     if (Test-Path $TargetStatePath) {
         try {
@@ -133,26 +130,6 @@ function Get-ProgressSnapshot {
         }
     }
 
-    if (Test-Path $TargetWorkspace) {
-        try {
-            $latestWorkspaceFile = Get-ChildItem -Path $TargetWorkspace -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Name -notlike 'launcher_resume_*.log' -and
-                    $_.Name -notlike 'stdout_resume_*.log' -and
-                    $_.Name -notlike 'stderr_resume_*.log' -and
-                    $_.Name -ne 'run_manifest.json'
-                } |
-                Sort-Object LastWriteTime -Descending |
-                Select-Object -First 1
-            if ($null -ne $latestWorkspaceFile) {
-                $workspaceLatestWriteAt = $latestWorkspaceFile.LastWriteTime.ToUniversalTime().ToString('o')
-                $workspaceLatestWritePath = $latestWorkspaceFile.FullName
-            }
-        }
-        catch {
-        }
-    }
-
     return [pscustomobject][ordered]@{
         completed_round = $completedRound
         current_round = $currentRound
@@ -162,8 +139,6 @@ function Get-ProgressSnapshot {
         status_total_units = $statusTotalUnits
         status_updated_at = $statusUpdatedAt
         current_task = $currentTask
-        workspace_latest_write_at = $workspaceLatestWriteAt
-        workspace_latest_write_path = $workspaceLatestWritePath
     }
 }
 
@@ -269,7 +244,7 @@ while ($true) {
     $attemptTs = Get-Date -Format 'yyyyMMdd_HHmmss'
     $stdout = Join-Path $workspace ('stdout_resume_' + $attemptTs + '.log')
     $stderr = Join-Path $workspace ('stderr_resume_' + $attemptTs + '.log')
-    $beforeSnapshot = Get-ProgressSnapshot -TargetStatePath $statePath -TargetStatusPath $statusPath -TargetWorkspace $workspace
+    $beforeSnapshot = Get-ProgressSnapshot -TargetStatePath $statePath -TargetStatusPath $statusPath
     $beforeSignature = Get-SnapshotSignature -Snapshot $beforeSnapshot
 
     Write-TraceLine ('attempt=' + $attempt + ' starting')
@@ -280,7 +255,7 @@ while ($true) {
     & $pythonExe @args 1>> $stdout 2>> $stderr
     $exitCode = $LASTEXITCODE
 
-    $afterSnapshot = Get-ProgressSnapshot -TargetStatePath $statePath -TargetStatusPath $statusPath -TargetWorkspace $workspace
+    $afterSnapshot = Get-ProgressSnapshot -TargetStatePath $statePath -TargetStatusPath $statusPath
     $afterSignature = Get-SnapshotSignature -Snapshot $afterSnapshot
     $progressChanged = $beforeSignature -ne $afterSignature
     if ($progressChanged) {

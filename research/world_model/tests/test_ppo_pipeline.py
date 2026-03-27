@@ -33,6 +33,7 @@ from gitcg_world_model.ppo_pipeline import (
     _shortlist_candidate_epochs,
     run_ppo_managed_loop,
 )
+from gitcg_world_model.ppo_training import PpoTrainArtifacts
 from gitcg_world_model.replay import append_episode_records, load_episode_records
 from gitcg_world_model.schema import EnvConfig, EpisodeRecord, PlayerSnapshot, StateSnapshot
 from gitcg_world_model.testsupport import synthetic_episode_record
@@ -70,6 +71,99 @@ def _dummy_episode(*, matchup: str, seed: int, winner: int = 0) -> EpisodeRecord
 
 
 class PpoPipelineTests(unittest.TestCase):
+    def test_select_active_slot_checkpoint_emits_selection_progress(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            train_dir = Path(temp_dir)
+            candidates_dir = train_dir / "candidates"
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = candidates_dir / "epoch_001.pt"
+            checkpoint_path.write_bytes(b"candidate")
+            deployment_path = train_dir / "deployment.pt"
+            deployment_path.write_bytes(b"deployment")
+            summary_path = train_dir / "training_summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "candidate_epochs": [1],
+                        "history": [
+                            {
+                                "total_loss": 1.0,
+                                "monitor_total_loss": 0.8,
+                                "approx_kl": 0.01,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            train_artifacts = PpoTrainArtifacts(
+                output_dir=str(train_dir),
+                training_checkpoint=str(train_dir / "last.pt"),
+                deployment_checkpoint=str(deployment_path),
+                summary_path=str(summary_path),
+                best_epoch=1,
+                best_score=0.8,
+                device="cpu",
+                sample_count=1,
+            )
+            selection_events: list[tuple[int, int, int, int, int, str]] = []
+
+            def fake_eval(**kwargs):
+                callback = kwargs.get("progress_callback")
+                if callback is not None:
+                    callback(
+                        1,
+                        1,
+                        _dummy_episode(matchup=SMALL_DECK_MATCHUPS[0].key, seed=0, winner=1),
+                        "main_0001",
+                    )
+                return (
+                    0.25,
+                    {"main_0001": 0.25},
+                    (
+                        {
+                            "opponent_policy_id": "main_0001",
+                            "matchup": SMALL_DECK_MATCHUPS[0].key,
+                            "episodes": 1,
+                            "wins": 1,
+                            "losses": 0,
+                            "draws": 0,
+                            "payoff": 1.0,
+                        },
+                    ),
+                )
+
+            with patch(
+                "gitcg_world_model.ppo_pipeline._evaluate_checkpoint_against_population",
+                side_effect=fake_eval,
+            ):
+                deployment_checkpoint, selected_epoch, selection_summary_path, selected = _select_active_slot_checkpoint(
+                    train_dir=train_dir,
+                    train_artifacts=train_artifacts,
+                    env_config=EnvConfig(deck_pool=SMALL_DECK_POOL),
+                    matchups=SMALL_DECK_MATCHUPS[:1],
+                    device="cpu",
+                    max_decisions=4,
+                    seed_start=0,
+                    benchmark_config=BenchmarkConfig(episodes_per_matchup=1),
+                    frozen_population=(SimpleNamespace(policy_id="main_0001"),),
+                    meta_strategy=SimpleNamespace(probabilities={"main_0001": 1.0}),
+                    workers=1,
+                    inference_server=None,
+                    cache=None,
+                    enable_status_print=False,
+                    selection_progress_callback=lambda candidate_index, candidate_total, eval_epoch, done, total, episode, opponent_policy_id: selection_events.append(
+                        (candidate_index, candidate_total, eval_epoch, done, total, opponent_policy_id)
+                    ),
+                    round_index=1,
+                )
+
+        self.assertEqual(selected_epoch, 1)
+        self.assertEqual(Path(deployment_checkpoint), deployment_path)
+        self.assertEqual(Path(selection_summary_path).name, "selection_summary.json")
+        self.assertEqual(selected.epoch, 1)
+        self.assertEqual(selection_events, [(1, 1, 1, 1, 1, "main_0001")])
+
     def test_execute_episode_jobs_uses_parallel_path_when_workers_gt_one(self):
         config = EnvConfig(deck_pool=SMALL_DECK_POOL)
         jobs = tuple(
