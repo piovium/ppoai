@@ -170,9 +170,9 @@ def _recommended_rollout_workers(requested_workers: int, checkpoint_path: Path |
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
-    max_safe_kl: float = 0.03
-    shortlist_size: int = 6
-    episodes_per_matchup: int = 3
+    max_safe_kl: float = 0.30
+    shortlist_size: int = 3
+    episodes_per_matchup: int = 4
     fail_fast: bool = False
     composite_tie_epsilon: float = 0.25
 
@@ -239,7 +239,6 @@ class _SlotCandidateEvaluation:
     epoch: int
     checkpoint_path: str
     expected_payoff_vs_meta: float
-    uniform_population_payoff: float
     matchup_results: tuple[dict[str, object], ...]
     per_policy_payoffs: dict[str, float]
     meta_policy_probabilities: dict[str, float]
@@ -987,34 +986,27 @@ def _shortlist_candidate_epochs(
     max_safe_kl: float,
     shortlist_size: int,
 ) -> tuple[list[int], list[int], str | None]:
+    history = list(summary_payload.get("history", []))
     safe_epochs = _safe_candidate_epochs(summary_payload, max_safe_kl=max_safe_kl)
     fallback_reason: str | None = None
     if safe_epochs:
-        ranked = list(safe_epochs)
+        ranked = [
+            safe_epochs[-1],
+            min(safe_epochs, key=lambda epoch: float(history[epoch - 1]["total_loss"])),
+            min(safe_epochs, key=lambda epoch: float(history[epoch - 1]["value_loss"])),
+        ]
     else:
-        history = list(summary_payload.get("history", []))
         candidate_epochs = _candidate_epochs_from_summary(summary_payload)
         if not candidate_epochs:
             return [], [], "no_candidate_epochs"
         ranked = [min(candidate_epochs, key=lambda epoch: float(history[epoch - 1]["approx_kl"]))]
         fallback_reason = "no_safe_epoch"
-    if shortlist_size <= 0 or len(ranked) <= shortlist_size:
-        return ranked, safe_epochs, fallback_reason
-    if shortlist_size == 1:
-        return [ranked[-1]], safe_epochs, fallback_reason
     shortlist: list[int] = []
-    stride = float(len(ranked) - 1) / float(shortlist_size - 1)
-    for index in range(shortlist_size):
-        epoch = ranked[int(round(index * stride))]
+    for epoch in ranked:
         if epoch not in shortlist:
             shortlist.append(epoch)
-    if len(shortlist) < shortlist_size:
-        for epoch in reversed(ranked):
-            if epoch not in shortlist:
-                shortlist.append(epoch)
-            if len(shortlist) >= shortlist_size:
-                break
-        shortlist.sort(key=ranked.index)
+        if len(shortlist) >= shortlist_size:
+            break
     return shortlist, safe_epochs, fallback_reason
 
 
@@ -1089,7 +1081,6 @@ def _load_completed_slot_artifacts(
         epoch=selected_epoch,
         checkpoint_path=str(selected_checkpoint),
         expected_payoff_vs_meta=float(payload.get("expected_payoff_vs_meta", 0.0)),
-        uniform_population_payoff=float(payload.get("uniform_population_payoff", 0.0)),
         matchup_results=tuple(
             dict(item) for item in (selected_candidate_payload or {}).get("matchup_results", [])
         ),
@@ -1738,12 +1729,6 @@ def _payoff_from_counts(*, wins: int, losses: int, draws: int, episodes: int) ->
     return float(wins - losses - draws) / float(episodes)
 
 
-def _uniform_population_payoff(per_policy_payoffs: dict[str, float]) -> float:
-    if not per_policy_payoffs:
-        return 0.0
-    return float(sum(float(value) for value in per_policy_payoffs.values()) / len(per_policy_payoffs))
-
-
 def collect_p2sro_training_episodes(
     *,
     config: EnvConfig,
@@ -2044,7 +2029,6 @@ def _select_active_slot_checkpoint(
             epoch=epoch,
             checkpoint_path=str(checkpoint_path),
             expected_payoff_vs_meta=expected_payoff,
-            uniform_population_payoff=_uniform_population_payoff(per_policy_payoffs),
             matchup_results=matchup_payloads,
             per_policy_payoffs=per_policy_payoffs,
             meta_policy_probabilities=dict(meta_strategy.probabilities),
@@ -2054,8 +2038,7 @@ def _select_active_slot_checkpoint(
             print(
                 "[p2sro-selection] "
                 f"epoch={epoch} "
-                f"expected_payoff_vs_meta={expected_payoff:.4f} "
-                f"uniform_population_payoff={candidate.uniform_population_payoff:.4f}",
+                f"expected_payoff_vs_meta={expected_payoff:.4f}",
                 flush=True,
             )
     selected = max(candidates, key=lambda item: (item.expected_payoff_vs_meta, item.epoch))
@@ -2068,16 +2051,13 @@ def _select_active_slot_checkpoint(
     atomic_write_json(
         selection_summary_path,
         {
-            "selection_method": "empirical_payoff_vs_meta_over_safe_epochs",
+            "selection_method": "expected_payoff_vs_meta",
             "safe_epochs": safe_epochs,
             "shortlist_epochs": shortlist_epochs,
             "fallback_reason": fallback_reason,
             "selected_epoch": selected.epoch,
             "selected_checkpoint": selected.checkpoint_path,
-            "selection_score_name": "expected_payoff_vs_meta",
-            "selection_score": selected.expected_payoff_vs_meta,
             "expected_payoff_vs_meta": selected.expected_payoff_vs_meta,
-            "uniform_population_payoff": selected.uniform_population_payoff,
             "meta_policy_probabilities": dict(selected.meta_policy_probabilities),
             "selection_replay_path": (
                 str(selection_replay_path)
@@ -2089,7 +2069,6 @@ def _select_active_slot_checkpoint(
                     "epoch": item.epoch,
                     "checkpoint_path": item.checkpoint_path,
                     "expected_payoff_vs_meta": item.expected_payoff_vs_meta,
-                    "uniform_population_payoff": item.uniform_population_payoff,
                     "per_policy_payoffs": dict(item.per_policy_payoffs),
                     "matchup_results": [dict(result) for result in item.matchup_results],
                 }
@@ -2425,15 +2404,15 @@ def run_ppo_managed_loop(
     rounds: int = 20,
     init_checkpoint: str | Path | None = None,
     bootstrap_episodes_per_matchup: int = 8,
-    self_play_episodes_per_matchup: int = 6,
+    self_play_episodes_per_matchup: int = 8,
     max_rounds: int = 15,
     max_decisions: int | None = 512,
     draw_penalty: float = 1.0,
     batch_size: int = 64,
     micro_batch_size: int | None = None,
-    epochs: int = 10,
+    epochs: int = 12,
     bootstrap_epochs: int = 5,
-    learning_rate: float = 6.0e-4,
+    learning_rate: float = 1.0e-3,
     weight_decay: float = 1e-4,
     grad_clip_norm: float | None = 1.0,
     gamma: float = 0.99,
@@ -2443,14 +2422,9 @@ def run_ppo_managed_loop(
     value_coef: float = 0.5,
     belief_coef: float = 0.2,
     oracle_coef: float = 0.2,
-    search_coef: float = 0.25,
-    reference_kl_coef: float = 0.004,
-    target_kl_low: float = 0.003,
-    target_kl_high: float = 0.015,
-    monitor_split: float = 0.125,
-    min_monitor_chunks: int = 8,
-    early_stop_patience: int = 2,
-    min_epochs_before_early_stop: int = 4,
+    reference_kl_coef: float = 0.005,
+    target_kl_low: float = 0.01,
+    target_kl_high: float = 0.05,
     use_amp: bool | None = None,
     device: str = "auto",
     workers: int = 8,
@@ -2594,9 +2568,7 @@ def run_ppo_managed_loop(
                     "epoch": epoch_index,
                     "epochs": epoch_total,
                     "total_loss": metrics.total_loss,
-                    "monitor_total_loss": metrics.monitor_total_loss,
                     "approx_kl": metrics.approx_kl,
-                    "monitor_approx_kl": metrics.monitor_approx_kl,
                     "best": is_best,
                 },
             )
@@ -2605,10 +2577,8 @@ def run_ppo_managed_loop(
                     f"[{label}] "
                     f"round={round_index:04d} "
                     f"epoch={epoch_index}/{epoch_total} "
-                    f"train_loss={metrics.total_loss:.4f} "
-                    f"monitor_loss={metrics.monitor_total_loss:.4f} "
+                    f"loss={metrics.total_loss:.4f} "
                     f"kl={metrics.approx_kl:.4f} "
-                    f"monitor_kl={metrics.monitor_approx_kl:.4f} "
                     f"best={is_best}",
                     flush=True,
                 )
@@ -2893,14 +2863,9 @@ def run_ppo_managed_loop(
                 value_coef=value_coef,
                 belief_coef=belief_coef,
                 oracle_coef=oracle_coef,
-                search_coef=search_coef,
                 reference_kl_coef=reference_kl_coef,
                 target_kl_low=target_kl_low,
                 target_kl_high=target_kl_high,
-                monitor_split=monitor_split,
-                min_monitor_chunks=min_monitor_chunks,
-                early_stop_patience=early_stop_patience,
-                min_epochs_before_early_stop=min_epochs_before_early_stop,
                 use_amp=use_amp,
                 progress_callback=_training_phase_callback(
                     phase="active_main_slot",
@@ -3137,14 +3102,9 @@ def run_ppo_managed_loop(
                 value_coef=value_coef,
                 belief_coef=belief_coef,
                 oracle_coef=oracle_coef,
-                search_coef=search_coef,
                 reference_kl_coef=reference_kl_coef,
                 target_kl_low=target_kl_low,
                 target_kl_high=target_kl_high,
-                monitor_split=monitor_split,
-                min_monitor_chunks=min_monitor_chunks,
-                early_stop_patience=early_stop_patience,
-                min_epochs_before_early_stop=min_epochs_before_early_stop,
                 use_amp=use_amp,
                 progress_callback=_training_phase_callback(
                     phase="active_br_slot",

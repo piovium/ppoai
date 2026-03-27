@@ -6,7 +6,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -178,11 +178,6 @@ class PpoTrainChunk:
 @dataclass(frozen=True)
 class PpoTrainingMetrics:
     total_loss: float
-    monitor_total_loss: float
-    monitor_policy_loss: float
-    monitor_value_loss: float
-    monitor_belief_loss: float
-    monitor_approx_kl: float
     policy_loss: float
     high_policy_loss: float
     fresh_policy_loss: float
@@ -244,7 +239,7 @@ class _DecisionTransition:
 
 
 def build_ppo_samples(
-    episodes: Iterable[EpisodeRecord],
+    episodes: Sequence[EpisodeRecord],
     encoder: TokenObservationEncoder,
     *,
     gamma: float = 0.99,
@@ -265,36 +260,8 @@ def build_ppo_samples(
     return samples
 
 
-def iter_ppo_chunks(
-    episodes: Iterable[EpisodeRecord],
-    encoder: TokenObservationEncoder,
-    *,
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    include_old_logprob: bool = True,
-    chunk_length: int = 16,
-    burn_in: int = 4,
-    train_length: int = 12,
-) -> Iterator[PpoTrainChunk]:
-    for episode in episodes:
-        player_sequences = _build_player_sequences(
-            episode=episode,
-            encoder=encoder,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            include_old_logprob=include_old_logprob,
-        )
-        for sequence in player_sequences.values():
-            yield from _chunk_player_sequence(
-                sequence,
-                chunk_length=chunk_length,
-                burn_in=burn_in,
-                train_length=train_length,
-            )
-
-
 def build_ppo_chunks(
-    episodes: Iterable[EpisodeRecord],
+    episodes: Sequence[EpisodeRecord],
     encoder: TokenObservationEncoder,
     *,
     gamma: float = 0.99,
@@ -304,18 +271,25 @@ def build_ppo_chunks(
     burn_in: int = 4,
     train_length: int = 12,
 ) -> list[PpoTrainChunk]:
-    return list(
-        iter_ppo_chunks(
-            episodes,
-            encoder,
+    chunks: list[PpoTrainChunk] = []
+    for episode in episodes:
+        player_sequences = _build_player_sequences(
+            episode=episode,
+            encoder=encoder,
             gamma=gamma,
             gae_lambda=gae_lambda,
             include_old_logprob=include_old_logprob,
-            chunk_length=chunk_length,
-            burn_in=burn_in,
-            train_length=train_length,
         )
-    )
+        for sequence in player_sequences.values():
+            chunks.extend(
+                _chunk_player_sequence(
+                    sequence,
+                    chunk_length=chunk_length,
+                    burn_in=burn_in,
+                    train_length=train_length,
+                )
+            )
+    return chunks
 
 
 def bootstrap_pretrain_from_episodes(
@@ -369,8 +343,8 @@ def bootstrap_pretrain_from_episodes(
 
 def train_ppo_from_episodes(
     *,
-    episodes: Iterable[EpisodeRecord],
-    replay_episodes: Iterable[EpisodeRecord] | None = None,
+    episodes: Sequence[EpisodeRecord],
+    replay_episodes: Sequence[EpisodeRecord] | None = None,
     output_dir: str | Path,
     init_checkpoint: str | Path | None = None,
     env_config: EnvConfig | None = None,
@@ -379,7 +353,7 @@ def train_ppo_from_episodes(
     micro_batch_size: int | None = None,
     epochs: int = 12,
     replay_epochs: int = 2,
-    learning_rate: float = 6.0e-4,
+    learning_rate: float = 1.0e-3,
     weight_decay: float = 1e-4,
     grad_clip_norm: float | None = 1.0,
     gamma: float = 0.99,
@@ -389,18 +363,13 @@ def train_ppo_from_episodes(
     value_coef: float = 0.5,
     belief_coef: float = 0.2,
     oracle_coef: float = 0.2,
-    search_coef: float = 0.25,
     use_amp: bool | None = None,
     chunk_length: int = 16,
     burn_in: int = 4,
     train_length: int = 12,
-    reference_kl_coef: float = 0.004,
-    target_kl_low: float = 0.003,
-    target_kl_high: float = 0.015,
-    monitor_split: float = 0.125,
-    min_monitor_chunks: int = 8,
-    early_stop_patience: int = 2,
-    min_epochs_before_early_stop: int = 4,
+    reference_kl_coef: float = 0.005,
+    target_kl_low: float = 0.01,
+    target_kl_high: float = 0.05,
     search_teacher_config: LookaheadSearchConfig | None = None,
     progress_callback: PpoTrainingProgressCallback | None = None,
 ) -> PpoTrainArtifacts:
@@ -422,7 +391,9 @@ def train_ppo_from_episodes(
             config=resolved_search_config,
         )
         del teacher_model
-        _release_training_build_memory(device=device)
+        gc.collect()
+        if torch.cuda.is_available() and torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
     fresh_chunks = build_ppo_chunks(
         training_episodes,
         encoder,
@@ -433,11 +404,9 @@ def train_ppo_from_episodes(
         burn_in=burn_in,
         train_length=train_length,
     )
-    del training_episodes
-    _release_training_build_memory(device=device)
-    replay_chunks = (
-        build_aux_replay_chunks(
-            replay_episodes,
+    replay_chunks = _select_aux_replay_chunks(
+        build_ppo_chunks(
+            tuple(replay_episodes or ()),
             encoder,
             gamma=gamma,
             gae_lambda=gae_lambda,
@@ -446,10 +415,7 @@ def train_ppo_from_episodes(
             burn_in=burn_in,
             train_length=train_length,
         )
-        if replay_episodes is not None
-        else ()
     )
-    _release_training_build_memory(device=device)
     return _fit_actor_critic(
         fresh_chunks=fresh_chunks,
         replay_chunks=replay_chunks,
@@ -470,7 +436,6 @@ def train_ppo_from_episodes(
         value_coef=value_coef,
         belief_coef=belief_coef,
         oracle_coef=oracle_coef,
-        search_coef=search_coef,
         use_amp=use_amp,
         chunk_length=chunk_length,
         burn_in=burn_in,
@@ -478,10 +443,6 @@ def train_ppo_from_episodes(
         reference_kl_coef=reference_kl_coef,
         target_kl_low=target_kl_low,
         target_kl_high=target_kl_high,
-        monitor_split=monitor_split,
-        min_monitor_chunks=min_monitor_chunks,
-        early_stop_patience=early_stop_patience,
-        min_epochs_before_early_stop=min_epochs_before_early_stop,
         progress_callback=progress_callback,
     )
 
@@ -806,46 +767,8 @@ def _select_aux_replay_chunks(chunks: Sequence[PpoTrainChunk]) -> tuple[PpoTrain
     return tuple(
         chunk
         for chunk in chunks
-        if _is_aux_replay_chunk(chunk)
+        if chunk.has_late_round or chunk.has_terminal_draw or chunk.has_terminal_loss or chunk.has_close_game
     )
-
-
-def build_aux_replay_chunks(
-    episodes: Iterable[EpisodeRecord],
-    encoder: TokenObservationEncoder,
-    *,
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    include_old_logprob: bool = True,
-    chunk_length: int = 16,
-    burn_in: int = 4,
-    train_length: int = 12,
-) -> tuple[PpoTrainChunk, ...]:
-    return tuple(
-        chunk
-        for chunk in iter_ppo_chunks(
-            episodes,
-            encoder,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            include_old_logprob=include_old_logprob,
-            chunk_length=chunk_length,
-            burn_in=burn_in,
-            train_length=train_length,
-        )
-        if _is_aux_replay_chunk(chunk)
-    )
-
-
-def _is_aux_replay_chunk(chunk: PpoTrainChunk) -> bool:
-    return chunk.has_late_round or chunk.has_terminal_draw or chunk.has_terminal_loss or chunk.has_close_game
-
-
-def _release_training_build_memory(*, device: str) -> None:
-    gc.collect()
-    resolved_device = torch.device(device)
-    if torch.cuda.is_available() and resolved_device.type == "cuda":
-        torch.cuda.empty_cache()
 
 
 def _adapt_reference_kl_coef(
@@ -877,90 +800,6 @@ def _adapt_reference_kl_coef(
     return min(max_coef, max(min_coef, next_coef))
 
 
-def _empty_epoch_metrics() -> dict[str, float]:
-    return {
-        "total_loss": 0.0,
-        "policy_loss": 0.0,
-        "high_policy_loss": 0.0,
-        "reference_kl_loss": 0.0,
-        "value_loss": 0.0,
-        "entropy": 0.0,
-        "belief_loss": 0.0,
-        "belief_hand_loss": 0.0,
-        "belief_deck_loss": 0.0,
-        "belief_burst_loss": 0.0,
-        "belief_group_hand_loss": 0.0,
-        "belief_group_deck_loss": 0.0,
-        "search_distill_loss": 0.0,
-        "search_policy_loss": 0.0,
-        "search_value_loss": 0.0,
-        "oracle_loss": 0.0,
-        "oracle_distill_loss": 0.0,
-        "approx_kl": 0.0,
-    }
-
-
-def _evenly_spaced_indices(total_count: int, sample_count: int) -> tuple[int, ...]:
-    if total_count <= 0 or sample_count <= 0:
-        return ()
-    if sample_count >= total_count:
-        return tuple(range(total_count))
-    selected: set[int] = set()
-    for index in range(sample_count):
-        position = int(math.floor(((index + 0.5) * total_count) / sample_count))
-        position = min(total_count - 1, max(0, position))
-        selected.add(position)
-    if len(selected) < sample_count:
-        for position in range(total_count - 1, -1, -1):
-            if position in selected:
-                continue
-            selected.add(position)
-            if len(selected) >= sample_count:
-                break
-    return tuple(sorted(selected))
-
-
-def _split_chunks_for_monitor(
-    chunks: Sequence[PpoTrainChunk],
-    *,
-    monitor_split: float,
-    min_monitor_chunks: int,
-) -> tuple[tuple[PpoTrainChunk, ...], tuple[PpoTrainChunk, ...], bool]:
-    chunk_tuple = tuple(chunks)
-    if not chunk_tuple:
-        return (), (), False
-    if len(chunk_tuple) == 1 or monitor_split <= 0.0:
-        return chunk_tuple, chunk_tuple, False
-    desired_count = max(
-        1,
-        int(math.ceil(len(chunk_tuple) * max(0.0, monitor_split))),
-        int(min_monitor_chunks),
-    )
-    max_monitor_count = max(1, len(chunk_tuple) // 4)
-    monitor_count = min(len(chunk_tuple) - 1, max_monitor_count, desired_count)
-    if monitor_count <= 0:
-        return chunk_tuple, chunk_tuple, False
-    monitor_indices = set(_evenly_spaced_indices(len(chunk_tuple), monitor_count))
-    train_chunks = tuple(chunk for index, chunk in enumerate(chunk_tuple) if index not in monitor_indices)
-    monitor_chunks = tuple(chunk for index, chunk in enumerate(chunk_tuple) if index in monitor_indices)
-    if not train_chunks or not monitor_chunks:
-        return chunk_tuple, chunk_tuple, False
-    return train_chunks, monitor_chunks, True
-
-
-def _combine_epoch_total_loss(
-    *,
-    main_metrics: dict[str, float],
-    replay_value_loss: float,
-    replay_belief_loss: float,
-) -> float:
-    return float(main_metrics["total_loss"] + (0.5 * replay_value_loss) + (0.2 * replay_belief_loss))
-
-
-def _selection_score_for_metrics(*, objective: str, metrics: PpoTrainingMetrics) -> float:
-    return metrics.monitor_total_loss if objective == "ppo" else metrics.total_loss
-
-
 def _fit_actor_critic(
     *,
     fresh_chunks: Sequence[PpoTrainChunk],
@@ -983,17 +822,12 @@ def _fit_actor_critic(
     value_coef: float = 0.5,
     belief_coef: float = 0.2,
     oracle_coef: float = 0.2,
-    search_coef: float = 0.25,
     chunk_length: int = 16,
     burn_in: int = 4,
     train_length: int = 12,
-    reference_kl_coef: float = 0.004,
-    target_kl_low: float = 0.003,
-    target_kl_high: float = 0.015,
-    monitor_split: float = 0.125,
-    min_monitor_chunks: int = 8,
-    early_stop_patience: int = 2,
-    min_epochs_before_early_stop: int = 4,
+    reference_kl_coef: float = 0.005,
+    target_kl_low: float = 0.01,
+    target_kl_high: float = 0.05,
     progress_callback: PpoTrainingProgressCallback | None = None,
 ) -> PpoTrainArtifacts:
     if not fresh_chunks:
@@ -1044,41 +878,16 @@ def _fit_actor_critic(
     )
     scaler = torch.amp.GradScaler("cuda", enabled=resolved_use_amp and resolved_device.type == "cuda")
     reference_model = _load_reference_model(reference_checkpoint, device=device) if objective == "ppo" else None
-    if objective == "ppo":
-        fresh_train_chunks, fresh_monitor_chunks, fresh_monitor_is_held_out = _split_chunks_for_monitor(
-            fresh_chunks,
-            monitor_split=monitor_split,
-            min_monitor_chunks=min_monitor_chunks,
-        )
-        replay_train_chunks, replay_monitor_chunks, replay_monitor_is_held_out = _split_chunks_for_monitor(
-            replay_chunks,
-            monitor_split=monitor_split,
-            min_monitor_chunks=min_monitor_chunks,
-        )
-    else:
-        fresh_train_chunks = tuple(fresh_chunks)
-        fresh_monitor_chunks = tuple(fresh_chunks)
-        fresh_monitor_is_held_out = False
-        replay_train_chunks = tuple(replay_chunks)
-        replay_monitor_chunks = tuple(replay_chunks)
-        replay_monitor_is_held_out = False
-    fresh_loader = _build_chunk_loader(fresh_train_chunks, batch_size=batch_size, objective=objective)
+    fresh_loader = _build_chunk_loader(fresh_chunks, batch_size=batch_size, objective=objective)
     replay_loader = (
-        _build_chunk_loader(replay_train_chunks, batch_size=batch_size, objective="aux_replay")
-        if replay_train_chunks
-        else None
-    )
-    fresh_monitor_loader = _build_eval_chunk_loader(fresh_monitor_chunks, batch_size=batch_size)
-    replay_monitor_loader = (
-        _build_eval_chunk_loader(replay_monitor_chunks, batch_size=batch_size)
-        if replay_monitor_chunks
+        _build_chunk_loader(replay_chunks, batch_size=batch_size, objective="aux_replay")
+        if replay_chunks
         else None
     )
 
     history: list[dict[str, float]] = []
     best_score = float("inf")
     best_epoch = 0
-    best_score_name = "monitor_total_loss" if objective == "ppo" else "total_loss"
     best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     latest_checkpoint = destination / "last.pt"
     deployment_checkpoint = destination / "deployment.pt"
@@ -1092,9 +901,6 @@ def _fit_actor_critic(
     current_reference_kl_coef = float(reference_kl_coef if objective == "ppo" else 0.0)
     min_reference_kl_coef = max(1.0e-5, current_reference_kl_coef * 0.125) if objective == "ppo" else 0.0
     max_reference_kl_coef = max(current_reference_kl_coef * 8.0, 0.05) if objective == "ppo" else 0.0
-    early_stop_triggered = False
-    early_stop_reason: str | None = None
-    epochs_without_improvement = 0
 
     for epoch_index in range(epochs):
         main_metrics = _run_training_epoch(
@@ -1112,7 +918,6 @@ def _fit_actor_critic(
             value_coef=value_coef,
             belief_coef=belief_coef,
             oracle_coef=oracle_coef,
-            search_coef=search_coef if objective == "ppo" else 0.0,
             reference_model=reference_model,
             reference_kl_coef=current_reference_kl_coef if objective == "ppo" else 0.0,
         )
@@ -1137,7 +942,6 @@ def _fit_actor_critic(
                     value_coef=value_coef,
                     belief_coef=belief_coef,
                     oracle_coef=oracle_coef,
-                    search_coef=0.0,
                     reference_model=None,
                     reference_kl_coef=0.0,
                 )
@@ -1145,68 +949,9 @@ def _fit_actor_critic(
                 replay_belief_total += aux_metrics["belief_loss"]
             replay_value_loss = replay_value_total / replay_epochs
             replay_belief_loss = replay_belief_total / replay_epochs
-        if objective == "ppo":
-            monitor_main_metrics = _evaluate_chunk_loader(
-                model=model,
-                loader=fresh_monitor_loader,
-                device=resolved_device,
-                use_amp=resolved_use_amp,
-                objective=objective,
-                entropy_coef=entropy_coef,
-                policy_coef=policy_coef,
-                value_coef=value_coef,
-                belief_coef=belief_coef,
-                oracle_coef=oracle_coef,
-                search_coef=search_coef,
-                reference_model=reference_model,
-                reference_kl_coef=reference_kl_coef,
-            )
-            monitor_replay_value_loss = 0.0
-            monitor_replay_belief_loss = 0.0
-            if replay_monitor_loader is not None and replay_epochs > 0:
-                replay_monitor_metrics = _evaluate_chunk_loader(
-                    model=model,
-                    loader=replay_monitor_loader,
-                    device=resolved_device,
-                    use_amp=resolved_use_amp,
-                    objective="aux_replay",
-                    entropy_coef=0.0,
-                    policy_coef=1.0,
-                    value_coef=value_coef,
-                    belief_coef=belief_coef,
-                    oracle_coef=oracle_coef,
-                    search_coef=0.0,
-                    reference_model=None,
-                    reference_kl_coef=0.0,
-                )
-                monitor_replay_value_loss = replay_monitor_metrics["value_loss"]
-                monitor_replay_belief_loss = replay_monitor_metrics["belief_loss"]
-            monitor_total_loss = _combine_epoch_total_loss(
-                main_metrics=monitor_main_metrics,
-                replay_value_loss=monitor_replay_value_loss,
-                replay_belief_loss=monitor_replay_belief_loss,
-            )
-        else:
-            monitor_main_metrics = dict(main_metrics)
-            monitor_replay_value_loss = replay_value_loss
-            monitor_replay_belief_loss = replay_belief_loss
-            monitor_total_loss = _combine_epoch_total_loss(
-                main_metrics=monitor_main_metrics,
-                replay_value_loss=monitor_replay_value_loss,
-                replay_belief_loss=monitor_replay_belief_loss,
-            )
 
         metrics = PpoTrainingMetrics(
-            total_loss=_combine_epoch_total_loss(
-                main_metrics=main_metrics,
-                replay_value_loss=replay_value_loss,
-                replay_belief_loss=replay_belief_loss,
-            ),
-            monitor_total_loss=monitor_total_loss,
-            monitor_policy_loss=monitor_main_metrics["policy_loss"],
-            monitor_value_loss=monitor_main_metrics["value_loss"],
-            monitor_belief_loss=monitor_main_metrics["belief_loss"],
-            monitor_approx_kl=monitor_main_metrics["approx_kl"],
+            total_loss=main_metrics["total_loss"] + 0.5 * replay_value_loss + 0.2 * replay_belief_loss,
             policy_loss=main_metrics["policy_loss"],
             high_policy_loss=main_metrics.get("high_policy_loss", 0.0),
             fresh_policy_loss=main_metrics["policy_loss"],
@@ -1234,15 +979,11 @@ def _fit_actor_critic(
         )
         history.append(metrics.__dict__)
         is_best = False
-        score = _selection_score_for_metrics(objective=objective, metrics=metrics)
-        if score < best_score:
-            best_score = score
+        if metrics.total_loss < best_score:
+            best_score = metrics.total_loss
             best_epoch = epoch_index + 1
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             is_best = True
-            epochs_without_improvement = 0
-        elif objective == "ppo":
-            epochs_without_improvement += 1
         if progress_callback is not None:
             progress_callback(epoch_index + 1, epochs, metrics, is_best)
         save_ppo_training_checkpoint(
@@ -1260,9 +1001,6 @@ def _fit_actor_critic(
                 "replay_chunk_count": replay_chunk_count,
                 "micro_batch_size": resolved_micro_batch_size,
                 "use_amp": resolved_use_amp,
-                "best_epoch": best_epoch,
-                "best_score": best_score,
-                "best_score_name": best_score_name,
             },
             optimizer_state=optimizer.state_dict(),
         )
@@ -1277,22 +1015,10 @@ def _fit_actor_critic(
                     "objective": objective,
                     "epoch": epoch_number,
                     "metrics": metrics.__dict__,
-                    "selection_score_name": best_score_name,
-                    "selection_score": score,
                 },
             )
             if metrics.approx_kl > target_kl_high:
                 effective_epochs = epoch_number
-                early_stop_reason = "approx_kl_high"
-                break
-            if (
-                early_stop_patience >= 0
-                and epoch_number >= max(1, min_epochs_before_early_stop)
-                and epochs_without_improvement >= early_stop_patience
-            ):
-                effective_epochs = epoch_number
-                early_stop_triggered = True
-                early_stop_reason = "monitor_plateau"
                 break
             current_reference_kl_coef = _adapt_reference_kl_coef(
                 current_reference_kl_coef,
@@ -1302,7 +1028,6 @@ def _fit_actor_critic(
                 min_coef=min_reference_kl_coef,
                 max_coef=max_reference_kl_coef,
             )
-    effective_epochs = min(effective_epochs, len(history))
     model.load_state_dict(best_state)
     save_ppo_deployment_checkpoint(
         deployment_checkpoint,
@@ -1312,7 +1037,6 @@ def _fit_actor_critic(
             "objective": objective,
             "best_epoch": best_epoch,
             "best_score": best_score,
-            "best_score_name": best_score_name,
         },
     )
     summary_path = destination / "training_summary.json"
@@ -1323,7 +1047,6 @@ def _fit_actor_critic(
             "device": device,
             "best_epoch": best_epoch,
             "best_score": best_score,
-            "best_score_name": best_score_name,
             "sample_count": sum(len(chunk.steps) for chunk in fresh_chunks),
             "history": history,
             "candidate_epochs": candidate_epochs,
@@ -1332,32 +1055,14 @@ def _fit_actor_critic(
                 if objective != "ppo"
                 else []
             ),
-            "selection_method": "min_total_loss" if objective != "ppo" else "min_monitor_total_loss",
+            "selection_method": "min_total_loss" if objective != "ppo" else None,
             "selected_epoch": best_epoch if objective != "ppo" else None,
             "chunk_length": chunk_length,
             "burn_in": burn_in,
             "train_length": train_length,
             "replay_chunk_count": replay_chunk_count,
             "replay_epochs": replay_epochs if objective == "ppo" else 0,
-            "monitor_split": monitor_split if objective == "ppo" else 0.0,
-            "min_monitor_chunks": min_monitor_chunks if objective == "ppo" else 0,
-            "monitor_fresh_chunk_count": len(fresh_monitor_chunks),
-            "monitor_replay_chunk_count": len(replay_monitor_chunks),
-            "monitor_fresh_is_held_out": fresh_monitor_is_held_out,
-            "monitor_replay_is_held_out": replay_monitor_is_held_out,
-            "early_stop_patience": early_stop_patience if objective == "ppo" else 0,
-            "min_epochs_before_early_stop": min_epochs_before_early_stop if objective == "ppo" else 0,
-            "early_stop_triggered": early_stop_triggered,
-            "early_stop_reason": early_stop_reason,
-            "learning_rate": learning_rate,
-            "weight_decay": weight_decay,
-            "grad_clip_norm": grad_clip_norm,
-            "entropy_coef": entropy_coef if objective == "ppo" else 0.0,
             "policy_coef": policy_coef if objective == "ppo" else 1.0,
-            "value_coef": value_coef,
-            "belief_coef": belief_coef,
-            "oracle_coef": oracle_coef,
-            "search_coef": search_coef if objective == "ppo" else 0.0,
             "reference_kl_coef": reference_kl_coef if objective == "ppo" else 0.0,
             "target_kl_low": target_kl_low if objective == "ppo" else 0.0,
             "target_kl_high": target_kl_high if objective == "ppo" else 0.0,
@@ -1393,14 +1098,6 @@ def _build_chunk_loader(
     return DataLoader(chunk_list, batch_size=batch_size, shuffle=True, collate_fn=_collate_chunks)
 
 
-def _build_eval_chunk_loader(
-    chunks: Sequence[PpoTrainChunk],
-    *,
-    batch_size: int,
-) -> DataLoader:
-    return DataLoader(list(chunks), batch_size=batch_size, shuffle=False, collate_fn=_collate_chunks)
-
-
 def _chunk_sampling_weight(chunk: PpoTrainChunk) -> float:
     weight = 1.0
     if chunk.has_late_round:
@@ -1428,18 +1125,56 @@ def _run_training_epoch(
     value_coef: float,
     belief_coef: float,
     oracle_coef: float,
-    search_coef: float,
     reference_model: PpoTransformerPolicy | None,
     reference_kl_coef: float,
 ) -> dict[str, float]:
     model.train()
-    aggregate = {**_empty_epoch_metrics(), "batches": 0}
+    aggregate = {
+        "total_loss": 0.0,
+        "policy_loss": 0.0,
+        "high_policy_loss": 0.0,
+        "reference_kl_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "belief_loss": 0.0,
+        "belief_hand_loss": 0.0,
+        "belief_deck_loss": 0.0,
+        "belief_burst_loss": 0.0,
+        "belief_group_hand_loss": 0.0,
+        "belief_group_deck_loss": 0.0,
+        "search_distill_loss": 0.0,
+        "search_policy_loss": 0.0,
+        "search_value_loss": 0.0,
+        "oracle_loss": 0.0,
+        "oracle_distill_loss": 0.0,
+        "approx_kl": 0.0,
+        "batches": 0,
+    }
     for batch in loader:
         batch_loss_steps = int(batch["loss_mask"].sum().item())
         if batch_loss_steps <= 0:
             continue
         optimizer.zero_grad(set_to_none=True)
-        batch_metrics = _empty_epoch_metrics()
+        batch_metrics = {
+            "total_loss": 0.0,
+            "policy_loss": 0.0,
+            "high_policy_loss": 0.0,
+            "reference_kl_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "belief_loss": 0.0,
+            "belief_hand_loss": 0.0,
+            "belief_deck_loss": 0.0,
+            "belief_burst_loss": 0.0,
+            "belief_group_hand_loss": 0.0,
+            "belief_group_deck_loss": 0.0,
+            "search_distill_loss": 0.0,
+            "search_policy_loss": 0.0,
+            "search_value_loss": 0.0,
+            "oracle_loss": 0.0,
+            "oracle_distill_loss": 0.0,
+            "approx_kl": 0.0,
+        }
         batch_items = int(batch["step_mask"].shape[0])
         for start in range(0, batch_items, micro_batch_size):
             stop = min(batch_items, start + micro_batch_size)
@@ -1463,7 +1198,6 @@ def _run_training_epoch(
                     value_coef=value_coef,
                     belief_coef=belief_coef,
                     oracle_coef=oracle_coef,
-                    search_coef=search_coef,
                     reference_model=reference_model,
                     reference_kl_coef=reference_kl_coef,
                 )
@@ -1497,62 +1231,6 @@ def _run_training_epoch(
     }
 
 
-def _evaluate_chunk_loader(
-    *,
-    model: PpoTransformerPolicy,
-    loader: DataLoader,
-    device: torch.device,
-    use_amp: bool,
-    objective: str,
-    entropy_coef: float,
-    policy_coef: float,
-    value_coef: float,
-    belief_coef: float,
-    oracle_coef: float,
-    search_coef: float,
-    reference_model: PpoTransformerPolicy | None,
-    reference_kl_coef: float,
-) -> dict[str, float]:
-    model.eval()
-    aggregate = {**_empty_epoch_metrics(), "batches": 0}
-    metric_keys = tuple(_empty_epoch_metrics().keys())
-    with torch.no_grad():
-        for batch in loader:
-            batch_loss_steps = int(batch["loss_mask"].sum().item())
-            if batch_loss_steps <= 0:
-                continue
-            amp_context = (
-                torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
-                if use_amp and device.type == "cuda"
-                else nullcontext()
-            )
-            with amp_context:
-                _, metrics, _ = _compute_chunk_batch_loss(
-                    model=model,
-                    batch=batch,
-                    device=device,
-                    objective=objective,
-                    entropy_coef=entropy_coef,
-                    policy_coef=policy_coef,
-                    value_coef=value_coef,
-                    belief_coef=belief_coef,
-                    oracle_coef=oracle_coef,
-                    search_coef=search_coef,
-                    reference_model=reference_model,
-                    reference_kl_coef=reference_kl_coef,
-                )
-            for key in metric_keys:
-                aggregate[key] += metrics[key]
-            aggregate["batches"] += 1
-    model.train()
-    batches = max(1, int(aggregate["batches"]))
-    return {
-        key: (aggregate[key] / batches if key != "batches" else float(batches))
-        for key in aggregate
-        if key != "batches"
-    }
-
-
 def _compute_chunk_batch_loss(
     *,
     model: PpoTransformerPolicy,
@@ -1564,7 +1242,6 @@ def _compute_chunk_batch_loss(
     value_coef: float,
     belief_coef: float,
     oracle_coef: float,
-    search_coef: float,
     reference_model: PpoTransformerPolicy | None,
     reference_kl_coef: float,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
@@ -1856,7 +1533,9 @@ def _compute_chunk_batch_loss(
             + high_policy_loss
             + (value_coef * value_loss)
             + (belief_coef * belief_loss)
-            + (search_coef * (search_distill_loss + search_policy_loss + search_value_loss))
+            + search_distill_loss
+            + search_policy_loss
+            + search_value_loss
             + (oracle_coef * (oracle_loss + oracle_distill_loss))
             + (reference_kl_coef * reference_kl_loss)
             - (entropy_coef * entropy if objective == "ppo" else 0.0)

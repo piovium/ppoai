@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
-from unittest.mock import patch
 
 import torch
 
@@ -14,12 +10,8 @@ from gitcg_world_model.ppo_model import masked_log_softmax
 from gitcg_world_model.ppo_training import (
     _adapt_reference_kl_coef,
     _action_efficiency_reward,
-    _empty_epoch_metrics,
-    _fit_actor_critic,
     _resolve_micro_batch_size,
     _select_aux_replay_chunks,
-    _split_chunks_for_monitor,
-    PpoTrainChunk,
     build_aux_replay_chunks,
     build_ppo_chunks,
     build_ppo_samples,
@@ -29,31 +21,6 @@ from gitcg_world_model.testsupport import encode_step_actions, materialize_legal
 
 
 class PpoTrainingTests(unittest.TestCase):
-    def test_split_chunks_for_monitor_uses_small_evenly_spaced_holdout(self):
-        chunks = tuple(
-            PpoTrainChunk(
-                steps=(),
-                burn_in=0,
-                loss_length=index + 1,
-                has_late_round=False,
-                has_terminal_draw=False,
-                has_terminal_loss=False,
-                has_close_game=False,
-            )
-            for index in range(12)
-        )
-
-        train_chunks, monitor_chunks, is_held_out = _split_chunks_for_monitor(
-            chunks,
-            monitor_split=0.125,
-            min_monitor_chunks=8,
-        )
-
-        self.assertTrue(is_held_out)
-        self.assertEqual(len(train_chunks), 9)
-        self.assertEqual(len(monitor_chunks), 3)
-        self.assertEqual([chunk.loss_length for chunk in monitor_chunks], [3, 7, 11])
-
     def test_adapt_reference_kl_coef_relaxes_when_kl_too_low(self):
         adapted = _adapt_reference_kl_coef(
             0.007,
@@ -313,91 +280,6 @@ class PpoTrainingTests(unittest.TestCase):
         reward = _action_efficiency_reward(tuning_then_end, perspective_player=0)
         self.assertLess(reward, 0.0)
         self.assertGreater(reward, -0.05)
-
-    def test_fit_actor_critic_uses_monitor_loss_for_selection_and_early_stop(self):
-        chunks = tuple(
-            PpoTrainChunk(
-                steps=(),
-                burn_in=0,
-                loss_length=index + 1,
-                has_late_round=False,
-                has_terminal_draw=False,
-                has_terminal_loss=False,
-                has_close_game=False,
-            )
-            for index in range(12)
-        )
-        train_metrics = [
-            {**_empty_epoch_metrics(), "total_loss": 1.50, "policy_loss": 0.40, "value_loss": 0.30, "belief_loss": 0.20, "approx_kl": 0.0010},
-            {**_empty_epoch_metrics(), "total_loss": 1.40, "policy_loss": 0.38, "value_loss": 0.28, "belief_loss": 0.19, "approx_kl": 0.0100},
-            {**_empty_epoch_metrics(), "total_loss": 1.30, "policy_loss": 0.36, "value_loss": 0.27, "belief_loss": 0.18, "approx_kl": 0.0100},
-            {**_empty_epoch_metrics(), "total_loss": 1.20, "policy_loss": 0.35, "value_loss": 0.26, "belief_loss": 0.17, "approx_kl": 0.0100},
-        ]
-        monitor_metrics = [
-            {**_empty_epoch_metrics(), "total_loss": 1.00, "policy_loss": 0.35, "value_loss": 0.25, "belief_loss": 0.15, "approx_kl": 0.0020},
-            {**_empty_epoch_metrics(), "total_loss": 0.80, "policy_loss": 0.33, "value_loss": 0.23, "belief_loss": 0.14, "approx_kl": 0.0025},
-            {**_empty_epoch_metrics(), "total_loss": 0.85, "policy_loss": 0.34, "value_loss": 0.24, "belief_loss": 0.145, "approx_kl": 0.0028},
-            {**_empty_epoch_metrics(), "total_loss": 0.86, "policy_loss": 0.345, "value_loss": 0.245, "belief_loss": 0.148, "approx_kl": 0.0029},
-        ]
-        train_coef_history: list[float] = []
-        monitor_coef_history: list[float] = []
-        progress: list[tuple[int, float, bool]] = []
-
-        def fake_run_training_epoch(*, reference_kl_coef: float, **kwargs):
-            train_coef_history.append(reference_kl_coef)
-            return dict(train_metrics[len(train_coef_history) - 1])
-
-        def fake_evaluate_chunk_loader(*, reference_kl_coef: float, **kwargs):
-            monitor_coef_history.append(reference_kl_coef)
-            return dict(monitor_metrics[len(monitor_coef_history) - 1])
-
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("gitcg_world_model.ppo_training._run_training_epoch", side_effect=fake_run_training_epoch),
-            patch("gitcg_world_model.ppo_training._evaluate_chunk_loader", side_effect=fake_evaluate_chunk_loader),
-        ):
-            artifacts = _fit_actor_critic(
-                fresh_chunks=chunks,
-                replay_chunks=(),
-                output_dir=temp_dir,
-                init_checkpoint=None,
-                reference_checkpoint=None,
-                device="cpu",
-                batch_size=2,
-                micro_batch_size=2,
-                epochs=6,
-                replay_epochs=0,
-                learning_rate=1.0e-3,
-                weight_decay=0.0,
-                grad_clip_norm=None,
-                use_amp=False,
-                objective="ppo",
-                reference_kl_coef=0.004,
-                target_kl_low=0.003,
-                target_kl_high=0.015,
-                monitor_split=0.125,
-                min_monitor_chunks=8,
-                early_stop_patience=2,
-                min_epochs_before_early_stop=3,
-                progress_callback=lambda epoch, total, metrics, is_best: progress.append(
-                    (epoch, metrics.monitor_total_loss, is_best)
-                ),
-            )
-            summary = json.loads(Path(artifacts.summary_path).read_text(encoding="utf-8"))
-
-        self.assertEqual(artifacts.best_epoch, 2)
-        self.assertAlmostEqual(artifacts.best_score, 0.80)
-        self.assertEqual(summary["best_score_name"], "monitor_total_loss")
-        self.assertEqual(summary["effective_epochs"], 4)
-        self.assertTrue(summary["early_stop_triggered"])
-        self.assertEqual(summary["early_stop_reason"], "monitor_plateau")
-        self.assertEqual(summary["monitor_fresh_chunk_count"], 3)
-        self.assertTrue(summary["monitor_fresh_is_held_out"])
-        self.assertEqual([item[0] for item in progress], [1, 2, 3, 4])
-        self.assertEqual([item[2] for item in progress], [True, True, False, False])
-        self.assertEqual(monitor_coef_history, [0.004, 0.004, 0.004, 0.004])
-        self.assertEqual(train_coef_history, [0.004, 0.002, 0.002, 0.002])
-        self.assertIn("monitor_total_loss", summary["history"][0])
 
 
 if __name__ == "__main__":

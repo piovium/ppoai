@@ -2447,10 +2447,6 @@ def run_ppo_managed_loop(
     reference_kl_coef: float = 0.004,
     target_kl_low: float = 0.003,
     target_kl_high: float = 0.015,
-    monitor_split: float = 0.125,
-    min_monitor_chunks: int = 8,
-    early_stop_patience: int = 2,
-    min_epochs_before_early_stop: int = 4,
     use_amp: bool | None = None,
     device: str = "auto",
     workers: int = 8,
@@ -2594,9 +2590,7 @@ def run_ppo_managed_loop(
                     "epoch": epoch_index,
                     "epochs": epoch_total,
                     "total_loss": metrics.total_loss,
-                    "monitor_total_loss": metrics.monitor_total_loss,
                     "approx_kl": metrics.approx_kl,
-                    "monitor_approx_kl": metrics.monitor_approx_kl,
                     "best": is_best,
                 },
             )
@@ -2605,10 +2599,8 @@ def run_ppo_managed_loop(
                     f"[{label}] "
                     f"round={round_index:04d} "
                     f"epoch={epoch_index}/{epoch_total} "
-                    f"train_loss={metrics.total_loss:.4f} "
-                    f"monitor_loss={metrics.monitor_total_loss:.4f} "
+                    f"loss={metrics.total_loss:.4f} "
                     f"kl={metrics.approx_kl:.4f} "
-                    f"monitor_kl={metrics.monitor_approx_kl:.4f} "
                     f"best={is_best}",
                     flush=True,
                 )
@@ -2897,10 +2889,6 @@ def run_ppo_managed_loop(
                 reference_kl_coef=reference_kl_coef,
                 target_kl_low=target_kl_low,
                 target_kl_high=target_kl_high,
-                monitor_split=monitor_split,
-                min_monitor_chunks=min_monitor_chunks,
-                early_stop_patience=early_stop_patience,
-                min_epochs_before_early_stop=min_epochs_before_early_stop,
                 use_amp=use_amp,
                 progress_callback=_training_phase_callback(
                     phase="active_main_slot",
@@ -3141,10 +3129,6 @@ def run_ppo_managed_loop(
                 reference_kl_coef=reference_kl_coef,
                 target_kl_low=target_kl_low,
                 target_kl_high=target_kl_high,
-                monitor_split=monitor_split,
-                min_monitor_chunks=min_monitor_chunks,
-                early_stop_patience=early_stop_patience,
-                min_epochs_before_early_stop=min_epochs_before_early_stop,
                 use_amp=use_amp,
                 progress_callback=_training_phase_callback(
                     phase="active_br_slot",

@@ -170,9 +170,9 @@ def _recommended_rollout_workers(requested_workers: int, checkpoint_path: Path |
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
-    max_safe_kl: float = 0.03
-    shortlist_size: int = 6
-    episodes_per_matchup: int = 3
+    max_safe_kl: float = 0.30
+    shortlist_size: int = 0
+    episodes_per_matchup: int = 4
     fail_fast: bool = False
     composite_tie_epsilon: float = 0.25
 
@@ -2425,15 +2425,15 @@ def run_ppo_managed_loop(
     rounds: int = 20,
     init_checkpoint: str | Path | None = None,
     bootstrap_episodes_per_matchup: int = 8,
-    self_play_episodes_per_matchup: int = 6,
+    self_play_episodes_per_matchup: int = 8,
     max_rounds: int = 15,
     max_decisions: int | None = 512,
     draw_penalty: float = 1.0,
     batch_size: int = 64,
     micro_batch_size: int | None = None,
-    epochs: int = 10,
+    epochs: int = 12,
     bootstrap_epochs: int = 5,
-    learning_rate: float = 6.0e-4,
+    learning_rate: float = 1.0e-3,
     weight_decay: float = 1e-4,
     grad_clip_norm: float | None = 1.0,
     gamma: float = 0.99,
@@ -2443,14 +2443,9 @@ def run_ppo_managed_loop(
     value_coef: float = 0.5,
     belief_coef: float = 0.2,
     oracle_coef: float = 0.2,
-    search_coef: float = 0.25,
-    reference_kl_coef: float = 0.004,
-    target_kl_low: float = 0.003,
-    target_kl_high: float = 0.015,
-    monitor_split: float = 0.125,
-    min_monitor_chunks: int = 8,
-    early_stop_patience: int = 2,
-    min_epochs_before_early_stop: int = 4,
+    reference_kl_coef: float = 0.005,
+    target_kl_low: float = 0.01,
+    target_kl_high: float = 0.05,
     use_amp: bool | None = None,
     device: str = "auto",
     workers: int = 8,
@@ -2594,9 +2589,7 @@ def run_ppo_managed_loop(
                     "epoch": epoch_index,
                     "epochs": epoch_total,
                     "total_loss": metrics.total_loss,
-                    "monitor_total_loss": metrics.monitor_total_loss,
                     "approx_kl": metrics.approx_kl,
-                    "monitor_approx_kl": metrics.monitor_approx_kl,
                     "best": is_best,
                 },
             )
@@ -2605,10 +2598,8 @@ def run_ppo_managed_loop(
                     f"[{label}] "
                     f"round={round_index:04d} "
                     f"epoch={epoch_index}/{epoch_total} "
-                    f"train_loss={metrics.total_loss:.4f} "
-                    f"monitor_loss={metrics.monitor_total_loss:.4f} "
+                    f"loss={metrics.total_loss:.4f} "
                     f"kl={metrics.approx_kl:.4f} "
-                    f"monitor_kl={metrics.monitor_approx_kl:.4f} "
                     f"best={is_best}",
                     flush=True,
                 )
@@ -2893,14 +2884,9 @@ def run_ppo_managed_loop(
                 value_coef=value_coef,
                 belief_coef=belief_coef,
                 oracle_coef=oracle_coef,
-                search_coef=search_coef,
                 reference_kl_coef=reference_kl_coef,
                 target_kl_low=target_kl_low,
                 target_kl_high=target_kl_high,
-                monitor_split=monitor_split,
-                min_monitor_chunks=min_monitor_chunks,
-                early_stop_patience=early_stop_patience,
-                min_epochs_before_early_stop=min_epochs_before_early_stop,
                 use_amp=use_amp,
                 progress_callback=_training_phase_callback(
                     phase="active_main_slot",
@@ -3137,14 +3123,9 @@ def run_ppo_managed_loop(
                 value_coef=value_coef,
                 belief_coef=belief_coef,
                 oracle_coef=oracle_coef,
-                search_coef=search_coef,
                 reference_kl_coef=reference_kl_coef,
                 target_kl_low=target_kl_low,
                 target_kl_high=target_kl_high,
-                monitor_split=monitor_split,
-                min_monitor_chunks=min_monitor_chunks,
-                early_stop_patience=early_stop_patience,
-                min_epochs_before_early_stop=min_epochs_before_early_stop,
                 use_amp=use_amp,
                 progress_callback=_training_phase_callback(
                     phase="active_br_slot",

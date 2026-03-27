@@ -15,15 +15,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--init-checkpoint")
     parser.add_argument("--bootstrap-episodes-per-matchup", type=int, default=8)
-    parser.add_argument("--self-play-episodes-per-matchup", type=int, default=6)
+    parser.add_argument("--self-play-episodes-per-matchup", type=int, default=8)
     parser.add_argument("--max-rounds", type=int, default=15)
     parser.add_argument("--max-decisions", type=int, default=512)
     parser.add_argument("--draw-penalty", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--micro-batch-size", type=int)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--bootstrap-epochs", type=int, default=5)
-    parser.add_argument("--learning-rate", type=float, default=6.0e-4)
+    parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -33,17 +33,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--belief-coef", type=float, default=0.2)
     parser.add_argument("--oracle-coef", type=float, default=0.2)
-    parser.add_argument("--search-coef", type=float, default=0.25)
-    parser.add_argument("--reference-kl-coef", type=float, default=0.004)
-    parser.add_argument("--target-kl-low", type=float, default=0.003)
-    parser.add_argument("--target-kl-high", type=float, default=0.015)
-    parser.add_argument("--monitor-split", type=float, default=0.125)
-    parser.add_argument("--min-monitor-chunks", type=int, default=8)
-    parser.add_argument("--early-stop-patience", type=int, default=2)
-    parser.add_argument("--min-epochs-before-early-stop", type=int, default=4)
-    parser.add_argument("--selection-max-safe-kl", type=float, default=0.03)
-    parser.add_argument("--selection-shortlist-size", type=int, default=6)
-    parser.add_argument("--selection-eval-episodes-per-matchup", type=int, default=3)
+    parser.add_argument("--reference-kl-coef", type=float, default=0.005)
+    parser.add_argument("--target-kl-low", type=float, default=0.01)
+    parser.add_argument("--target-kl-high", type=float, default=0.05)
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--workers", type=int, default=8)
@@ -60,14 +52,9 @@ def main() -> None:
     if platform.system() == "Windows":
         os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
-    from gitcg_world_model.ppo_pipeline import BenchmarkConfig, run_ppo_managed_loop
+    from gitcg_world_model.ppo_pipeline import run_ppo_managed_loop
 
     args = parse_args()
-    benchmark_config = BenchmarkConfig(
-        max_safe_kl=args.selection_max_safe_kl,
-        shortlist_size=args.selection_shortlist_size,
-        episodes_per_matchup=args.selection_eval_episodes_per_matchup,
-    )
     artifacts = run_ppo_managed_loop(
         workspace=args.workspace,
         rounds=args.rounds,
@@ -91,14 +78,9 @@ def main() -> None:
         value_coef=args.value_coef,
         belief_coef=args.belief_coef,
         oracle_coef=args.oracle_coef,
-        search_coef=args.search_coef,
         reference_kl_coef=args.reference_kl_coef,
         target_kl_low=args.target_kl_low,
         target_kl_high=args.target_kl_high,
-        monitor_split=args.monitor_split,
-        min_monitor_chunks=args.min_monitor_chunks,
-        early_stop_patience=args.early_stop_patience,
-        min_epochs_before_early_stop=args.min_epochs_before_early_stop,
         use_amp=args.use_amp,
         device=args.device,
         workers=args.workers,
@@ -108,7 +90,6 @@ def main() -> None:
         resume=args.resume,
         enable_status_print=args.status_print,
         retain_round_directories=args.retain_round_directories,
-        benchmark_config=benchmark_config,
     )
     payload = {
         "workspace": artifacts.workspace,

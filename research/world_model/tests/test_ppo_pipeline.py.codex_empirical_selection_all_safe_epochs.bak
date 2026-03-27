@@ -13,7 +13,6 @@ import torch
 
 from gitcg_world_model.decks import SMALL_DECK_MATCHUPS, SMALL_DECK_POOL
 from gitcg_world_model.ppo_pipeline import (
-    BenchmarkConfig,
     _append_benchmark_cache_episodes,
     _benchmark_eval_workers,
     _candidate_evaluation_to_payoff_results,
@@ -29,7 +28,6 @@ from gitcg_world_model.ppo_pipeline import (
     _round_base_checkpoint,
     _safe_candidate_epochs,
     _serialize_benchmark_cache_episode,
-    _select_active_slot_checkpoint,
     _shortlist_candidate_epochs,
     run_ppo_managed_loop,
 )
@@ -159,7 +157,7 @@ class PpoPipelineTests(unittest.TestCase):
         }
         self.assertEqual(_safe_candidate_epochs(payload, max_safe_kl=0.30), [1, 3, 4])
 
-    def test_shortlist_candidate_epochs_returns_all_safe_epochs_when_unlimited(self):
+    def test_shortlist_candidate_epochs_prefers_latest_total_and_value(self):
         payload = {
             "candidate_epochs": [1, 2, 3, 4],
             "history": [
@@ -173,32 +171,11 @@ class PpoPipelineTests(unittest.TestCase):
         shortlist, safe_epochs, fallback_reason = _shortlist_candidate_epochs(
             payload,
             max_safe_kl=0.30,
-            shortlist_size=0,
+            shortlist_size=3,
         )
 
         self.assertEqual(safe_epochs, [1, 3, 4])
-        self.assertEqual(shortlist, [1, 3, 4])
-        self.assertIsNone(fallback_reason)
-
-    def test_shortlist_candidate_epochs_evenly_downsamples_safe_epochs_when_limited(self):
-        payload = {
-            "candidate_epochs": [1, 2, 3, 4],
-            "history": [
-                {"total_loss": 0.10, "value_loss": 0.50, "approx_kl": 0.10},
-                {"total_loss": 0.05, "value_loss": 0.40, "approx_kl": 0.35},
-                {"total_loss": 0.20, "value_loss": 0.05, "approx_kl": 0.20},
-                {"total_loss": 0.30, "value_loss": 0.10, "approx_kl": 0.25},
-            ],
-        }
-
-        shortlist, safe_epochs, fallback_reason = _shortlist_candidate_epochs(
-            payload,
-            max_safe_kl=0.30,
-            shortlist_size=2,
-        )
-
-        self.assertEqual(safe_epochs, [1, 3, 4])
-        self.assertEqual(shortlist, [1, 4])
+        self.assertEqual(shortlist, [4, 1, 3])
         self.assertIsNone(fallback_reason)
 
     def test_shortlist_candidate_epochs_falls_back_to_lowest_kl(self):
@@ -226,7 +203,6 @@ class PpoPipelineTests(unittest.TestCase):
             epoch=6,
             checkpoint_path="candidate.pt",
             expected_payoff_vs_meta=0.25,
-            uniform_population_payoff=0.25,
             matchup_results=(
                 {
                     "opponent_policy_id": "main_0001",
@@ -490,113 +466,6 @@ class PpoPipelineTests(unittest.TestCase):
         self.assertEqual(len(replay_episodes), 1)
         self.assertGreater(len(replay_episodes[0].steps), 0)
 
-    def test_select_active_slot_checkpoint_uses_empirical_payoff_over_all_safe_epochs(self):
-        config = EnvConfig(deck_pool=SMALL_DECK_POOL)
-        frozen_population = (SimpleNamespace(policy_id="main_0001", checkpoint_path="main_0001.pt"),)
-        meta_strategy = SimpleNamespace(probabilities={"main_0001": 1.0})
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            train_dir = Path(temp_dir) / "train"
-            candidate_dir = train_dir / "candidates"
-            candidate_dir.mkdir(parents=True)
-            deployment_checkpoint = train_dir / "deployment.pt"
-            training_checkpoint = train_dir / "last.pt"
-            deployment_checkpoint.write_bytes(b"deployment")
-            training_checkpoint.write_bytes(b"training")
-            summary_path = train_dir / "training_summary.json"
-            summary_path.write_text(
-                json.dumps(
-                    {
-                        "candidate_epochs": [1, 2, 3, 4],
-                        "history": [
-                            {"total_loss": 0.01, "value_loss": 0.50, "approx_kl": 0.10},
-                            {"total_loss": 0.00, "value_loss": 0.01, "approx_kl": 0.80},
-                            {"total_loss": 0.50, "value_loss": 0.50, "approx_kl": 0.20},
-                            {"total_loss": 1.00, "value_loss": 1.00, "approx_kl": 0.25},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            for epoch in (1, 3, 4):
-                (candidate_dir / f"epoch_{epoch:03d}.pt").write_bytes(f"epoch-{epoch}".encode("utf-8"))
-
-            train_artifacts = SimpleNamespace(
-                output_dir=str(train_dir),
-                training_checkpoint=str(training_checkpoint),
-                deployment_checkpoint=str(deployment_checkpoint),
-                summary_path=str(summary_path),
-                best_epoch=2,
-                best_score=0.0,
-                device="cpu",
-                sample_count=1,
-            )
-
-            evaluated_epochs: list[int] = []
-            per_epoch_payoff = {
-                1: 0.10,
-                3: 0.40,
-                4: 0.20,
-            }
-
-            def fake_evaluate_checkpoint_against_population(**kwargs):
-                checkpoint_path = Path(kwargs["checkpoint_path"])
-                epoch = int(checkpoint_path.stem.split("_", maxsplit=1)[1])
-                evaluated_epochs.append(epoch)
-                payoff = per_epoch_payoff[epoch]
-                return (
-                    payoff,
-                    {"main_0001": payoff},
-                    (
-                        {
-                            "opponent_policy_id": "main_0001",
-                            "matchup": SMALL_DECK_MATCHUPS[0].key,
-                            "episodes": 1,
-                            "wins": 1 if payoff > 0.0 else 0,
-                            "losses": 0 if payoff > 0.0 else 1,
-                            "draws": 0,
-                            "payoff": payoff,
-                        },
-                    ),
-                )
-
-            with patch(
-                "gitcg_world_model.ppo_pipeline._evaluate_checkpoint_against_population",
-                side_effect=fake_evaluate_checkpoint_against_population,
-            ):
-                selected_checkpoint, selected_epoch, selection_summary_path, selected = _select_active_slot_checkpoint(
-                    train_dir=train_dir,
-                    train_artifacts=train_artifacts,
-                    env_config=config,
-                    matchups=(SMALL_DECK_MATCHUPS[0],),
-                    device="cpu",
-                    max_decisions=8,
-                    seed_start=11,
-                    benchmark_config=BenchmarkConfig(max_safe_kl=0.30, shortlist_size=0, episodes_per_matchup=1),
-                    frozen_population=frozen_population,
-                    meta_strategy=meta_strategy,
-                    workers=1,
-                    inference_server=None,
-                    cache={},
-                    enable_status_print=False,
-                    round_index=1,
-                )
-
-            selection_payload = json.loads(selection_summary_path.read_text(encoding="utf-8"))
-            selected_checkpoint_exists = Path(selected_checkpoint).exists()
-
-        self.assertEqual(evaluated_epochs, [1, 3, 4])
-        self.assertEqual(selected_epoch, 3)
-        self.assertEqual(selected.epoch, 3)
-        self.assertEqual(selection_payload["safe_epochs"], [1, 3, 4])
-        self.assertEqual(selection_payload["shortlist_epochs"], [1, 3, 4])
-        self.assertEqual(selection_payload["selection_method"], "empirical_payoff_vs_meta_over_safe_epochs")
-        self.assertEqual(selection_payload["selection_score_name"], "expected_payoff_vs_meta")
-        self.assertAlmostEqual(selection_payload["selection_score"], 0.40)
-        self.assertAlmostEqual(selection_payload["expected_payoff_vs_meta"], 0.40)
-        self.assertAlmostEqual(selection_payload["uniform_population_payoff"], 0.40)
-        self.assertTrue(selected_checkpoint_exists)
-
     def test_recommended_rollout_workers_caps_large_models(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = Path(temp_dir) / "deployment.pt"
@@ -666,12 +535,8 @@ class PpoPipelineTests(unittest.TestCase):
             self.assertIn("meta_probabilities", analysis_payload)
             self.assertIn("active_main_slot", analysis_payload)
             self.assertIn("active_br_slot", analysis_payload)
-            self.assertEqual(main_selection["selection_method"], "empirical_payoff_vs_meta_over_safe_epochs")
-            self.assertEqual(br_selection["selection_method"], "empirical_payoff_vs_meta_over_safe_epochs")
-            self.assertEqual(main_selection["selection_score_name"], "expected_payoff_vs_meta")
-            self.assertEqual(br_selection["selection_score_name"], "expected_payoff_vs_meta")
-            self.assertIn("uniform_population_payoff", main_selection)
-            self.assertIn("uniform_population_payoff", br_selection)
+            self.assertEqual(main_selection["selection_method"], "expected_payoff_vs_meta")
+            self.assertEqual(br_selection["selection_method"], "expected_payoff_vs_meta")
             self.assertIn("selection_replay_path", main_selection)
             self.assertIn("selection_replay_path", br_selection)
             self.assertTrue(main_selection_replay)
